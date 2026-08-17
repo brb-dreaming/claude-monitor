@@ -198,8 +198,17 @@ def is_self_command(command: Optional[Command]) -> bool:
 
     self_path = str(HOME / ".claude" / "hooks" / "codex_notify.py")
     if isinstance(command, list):
-        return any(Path(part).expanduser() == Path(self_path) for part in command)
-    return self_path in command
+        # A command can embed us inside one of its own arguments rather than
+        # naming us as a whole part — Codex's computer-use client registers as
+        # `... turn-ended --previous-notify '["python3","<self>"]'`, JSON-escaped
+        # slashes and all. Preserving that as the "previous" notifier is what
+        # builds a notify loop, so match on a de-escaped substring too.
+        return any(
+            Path(part).expanduser() == Path(self_path)
+            or self_path in part.replace("\\/", "/")
+            for part in command
+        )
+    return self_path in command.replace("\\/", "/")
 
 
 def replace_top_level_notify(text: str, notify_line: str) -> str:

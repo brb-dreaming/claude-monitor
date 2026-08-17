@@ -908,12 +908,42 @@ struct SessionInfo: Codable, Identifiable, Equatable {
 
 // MARK: - Permission Model
 
-struct PermissionInfo: Codable, Equatable {
+struct PermissionInfo: Codable, Equatable, Identifiable {
+    let request_id: String
+    let session_id: String
     let tool_name: String
     let display: String
     let tool_input: String
     let timestamp: String
     let pid: String?  // legacy, kept for decode compat
+
+    var id: String { request_id }
+
+    enum CodingKeys: String, CodingKey {
+        case request_id, session_id, tool_name, display, tool_input, timestamp, pid
+    }
+
+    init(requestId: String, sessionId: String, toolName: String, display: String,
+         toolInput: String, timestamp: String, pid: String?) {
+        request_id = requestId
+        session_id = sessionId
+        tool_name = toolName
+        self.display = display
+        tool_input = toolInput
+        self.timestamp = timestamp
+        self.pid = pid
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        request_id = try c.decodeIfPresent(String.self, forKey: .request_id) ?? ""
+        session_id = try c.decodeIfPresent(String.self, forKey: .session_id) ?? ""
+        tool_name = try c.decodeIfPresent(String.self, forKey: .tool_name) ?? "Unknown"
+        display = try c.decodeIfPresent(String.self, forKey: .display) ?? ""
+        tool_input = try c.decodeIfPresent(String.self, forKey: .tool_input) ?? ""
+        timestamp = try c.decodeIfPresent(String.self, forKey: .timestamp) ?? ""
+        pid = try c.decodeIfPresent(String.self, forKey: .pid)
+    }
 
     var toolIcon: String {
         switch tool_name {
@@ -934,10 +964,18 @@ class PermissionSocketServer {
     static let shared = PermissionSocketServer()
     private let socketPath = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/monitor/monitor.sock").path
     private var serverFd: Int32 = -1
+    private var ownsSocketPath = false
     private let queue = DispatchQueue(label: "monitor.socket", qos: .userInteractive)
-    // Map session_id -> client file descriptor (kept open, waiting for response)
-    private var pendingClients: [String: Int32] = [:]
+    private let cleanupQueue = DispatchQueue(label: "monitor.socket.cleanup", qos: .utility)
+    private struct PendingClient {
+        let fd: Int32
+        let sessionId: String
+        let deadline: Date
+    }
+    // Request IDs allow parallel permission prompts within one agent session.
+    private var pendingClients: [String: PendingClient] = [:]
     private let lock = NSLock()
+    private var cleanupTimer: DispatchSourceTimer?
 
     func start() {
         // Clean up stale socket
@@ -966,8 +1004,10 @@ class PermissionSocketServer {
         guard bindResult == 0 else {
             NSLog("[AgentMonitor] Socket: bind failed: %d", errno)
             Darwin.close(serverFd)
+            serverFd = -1
             return
         }
+        ownsSocketPath = true
 
         // Restrict socket to owner only
         chmod(socketPath, 0o600)
@@ -975,6 +1015,11 @@ class PermissionSocketServer {
         guard listen(serverFd, 5) == 0 else {
             NSLog("[AgentMonitor] Socket: listen failed")
             Darwin.close(serverFd)
+            serverFd = -1
+            if ownsSocketPath {
+                unlink(socketPath)
+                ownsSocketPath = false
+            }
             return
         }
 
@@ -984,6 +1029,13 @@ class PermissionSocketServer {
         queue.async { [weak self] in
             self?.acceptLoop()
         }
+        // The accept loop blocks its serial queue, so expiration must run on a
+        // separate queue or abandoned permission clients would remain open.
+        let timer = DispatchSource.makeTimerSource(queue: cleanupQueue)
+        timer.schedule(deadline: .now() + 30, repeating: 30)
+        timer.setEventHandler { [weak self] in self?.expirePendingClients() }
+        timer.resume()
+        cleanupTimer = timer
     }
 
     private func acceptLoop() {
@@ -997,6 +1049,21 @@ class PermissionSocketServer {
             }
             guard clientFd >= 0 else { continue }
 
+            var noSigPipe: Int32 = 1
+            _ = setsockopt(
+                clientFd, SOL_SOCKET, SO_NOSIGPIPE,
+                &noSigPipe, socklen_t(MemoryLayout<Int32>.size)
+            )
+            do {
+                // Bound clients before frame parsing. The pending-client deadline
+                // below only begins after a complete request has been decoded.
+                try IPCFrame.setReceiveTimeout(on: clientFd, seconds: 10)
+            } catch {
+                NSLog("[AgentMonitor] Socket: failed to set request timeout: %@", error.localizedDescription)
+                Darwin.close(clientFd)
+                continue
+            }
+
             // Handle each client in its own dispatch
             DispatchQueue.global(qos: .userInteractive).async { [weak self] in
                 self?.handleClient(fd: clientFd)
@@ -1005,62 +1072,94 @@ class PermissionSocketServer {
     }
 
     private func handleClient(fd: Int32) {
-        // Read the request
-        var buffer = [UInt8](repeating: 0, count: 8192)
-        let bytesRead = read(fd, &buffer, buffer.count)
-        guard bytesRead > 0 else {
+        let data: Data
+        do {
+            data = try IPCFrame.read(from: fd)
+        } catch {
+            NSLog("[AgentMonitor] Socket: invalid request frame: %@", error.localizedDescription)
             Darwin.close(fd)
             return
         }
 
-        let data = Data(buffer[0..<bytesRead])
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let type = json["type"] as? String,
               type == "permission_request",
-              let sessionId = json["session_id"] as? String else {
+              (json["protocol_version"] as? Int) == 1,
+              let requestId = json["request_id"] as? String,
+              let sessionId = json["session_id"] as? String,
+              !requestId.isEmpty else {
             Darwin.close(fd)
             return
         }
 
-        NSLog("[AgentMonitor] Socket: permission request from session %@", sessionId)
+        NSLog("[AgentMonitor] Socket: permission request %@ from session %@", requestId, sessionId)
 
         // Store the client fd — keep the connection open until user responds
         lock.lock()
-        // Close any existing pending client for this session
-        if let old = pendingClients[sessionId] {
-            Darwin.close(old)
+        if let old = pendingClients[requestId] {
+            Darwin.close(old.fd)
         }
-        pendingClients[sessionId] = fd
+        let requestedTimeout = (json["timeout_seconds"] as? Double) ?? 300
+        let timeout = min(max(requestedTimeout, 1), 600)
+        pendingClients[requestId] = PendingClient(
+            fd: fd,
+            sessionId: sessionId,
+            deadline: Date().addingTimeInterval(timeout + 5)
+        )
         lock.unlock()
     }
 
-    func respond(sessionId: String, decision: String) {
+    private func expirePendingClients() {
+        let now = Date()
         lock.lock()
-        guard let fd = pendingClients.removeValue(forKey: sessionId) else {
+        let expired = pendingClients.filter { $0.value.deadline <= now }
+        for (requestId, client) in expired {
+            pendingClients.removeValue(forKey: requestId)
+            Darwin.close(client.fd)
+            NSLog("[AgentMonitor] Socket: expired permission request %@", requestId)
+        }
+        lock.unlock()
+    }
+
+    @discardableResult
+    func respond(requestId: String, decision: String) -> Bool {
+        lock.lock()
+        guard let client = pendingClients.removeValue(forKey: requestId) else {
             lock.unlock()
-            NSLog("[AgentMonitor] Socket: no pending client for session %@", sessionId)
-            return
+            NSLog("[AgentMonitor] Socket: no pending client for request %@", requestId)
+            return false
         }
         lock.unlock()
 
-        let responseData = try? JSONSerialization.data(withJSONObject: ["decision": decision])
-        let bytes = responseData.map { Array($0) } ?? Array("{\"decision\":\"deny\"}".utf8)
-        bytes.withUnsafeBufferPointer { ptr in
-            _ = write(fd, ptr.baseAddress!, ptr.count)
+        do {
+            let responseData = try JSONSerialization.data(withJSONObject: ["decision": decision])
+            try IPCFrame.write(responseData, to: client.fd)
+        } catch {
+            NSLog("[AgentMonitor] Socket: response failed for %@: %@", requestId, error.localizedDescription)
+            Darwin.close(client.fd)
+            return false
         }
-        Darwin.close(fd)
-        NSLog("[AgentMonitor] Socket: sent %@ to session %@", decision, sessionId)
+        Darwin.close(client.fd)
+        NSLog("[AgentMonitor] Socket: sent %@ to request %@ (session %@)", decision, requestId, client.sessionId)
+        return true
     }
 
     func stop() {
+        cleanupTimer?.cancel()
+        cleanupTimer = nil
         if serverFd >= 0 {
             Darwin.close(serverFd)
             serverFd = -1
         }
-        unlink(socketPath)
+        // A process that lost the singleton race never bound this path and must
+        // not unlink the active instance's socket during its termination callback.
+        if ownsSocketPath {
+            unlink(socketPath)
+            ownsSocketPath = false
+        }
         lock.lock()
-        for (_, fd) in pendingClients {
-            Darwin.close(fd)
+        for (_, client) in pendingClients {
+            Darwin.close(client.fd)
         }
         pendingClients.removeAll()
         lock.unlock()
@@ -1102,7 +1201,7 @@ func wezTermCLIProcess(arguments: [String]) -> Process {
 
 class SessionReader: ObservableObject {
     @Published var sessions: [SessionInfo] = []
-    @Published var permissions: [String: PermissionInfo] = [:]
+    @Published var permissions: [String: [PermissionInfo]] = [:]
     private var timer: Timer?
     private var livenessTimer: Timer?
     private var discoveryTimer: Timer?
@@ -1112,6 +1211,26 @@ class SessionReader: ObservableObject {
     private var sessionsDirFD: CInt = -1
     private var sessionsWatcher: DispatchSourceFileSystemObject?
     private var codexLogPathsByThreadID: [String: String] = [:]
+    /// Incremental-read state for codex rollout logs, keyed by absolute path.
+    /// These files are append-only and can reach tens of MB; re-reading and
+    /// re-parsing every one on every 5s tick was allocating hundreds of MB per
+    /// minute to recover three fields that never change for finished sessions.
+    /// `offset` is always a newline boundary so a partially-written trailing
+    /// line is re-read whole on the next tick rather than lost.
+    private struct CodexLogCursor {
+        var offset: UInt64
+        var mtime: Date
+        /// Accumulated last-wins state. Kept even when `updatedAt` is still
+        /// empty so a `lastPrompt` seen in an early chunk survives to the tick
+        /// that finally reads a task_started/task_complete.
+        var snapshot: CodexLogSnapshot?
+        /// Matches the original contract: no timestamp yet means no usable read.
+        var returnable: CodexLogSnapshot? {
+            guard let snapshot, !snapshot.updatedAt.isEmpty else { return nil }
+            return snapshot
+        }
+    }
+    private var codexLogCursors: [String: CodexLogCursor] = [:]
 
     let sessionsDir: String = {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
@@ -1154,7 +1273,12 @@ class SessionReader: ObservableObject {
     }
 
     private func ensureSessionsDirExists() {
-        try? FileManager.default.createDirectory(atPath: sessionsDir, withIntermediateDirectories: true)
+        let directory = URL(fileURLWithPath: sessionsDir, isDirectory: true)
+        do {
+            try SessionFileStore.repairPermissions(in: directory)
+        } catch {
+            NSLog("[AgentMonitor] Session store setup failed: %@", error.localizedDescription)
+        }
     }
 
     private func startWatchingSessionsDir() {
@@ -1176,12 +1300,20 @@ class SessionReader: ObservableObject {
         sessionsWatcher?.resume()
     }
 
-    func respondToPermission(sessionId: String, decision: String) {
+    @discardableResult
+    func respondToPermission(sessionId: String, requestId: String, decision: String) -> Bool {
         // Send response through the socket server
-        PermissionSocketServer.shared.respond(sessionId: sessionId, decision: decision)
+        guard PermissionSocketServer.shared.respond(requestId: requestId, decision: decision) else {
+            // The permission file can become visible just before its socket is
+            // registered. Keep the card available so the decision is not lost.
+            return false
+        }
 
         // Remove the permission card (delay for "terminal" so Claude Code can show its dialog)
-        let permFile = "\(sessionsDir)/\(sessionId).permission"
+        let filename = requestId.isEmpty
+            ? "\(sessionId).permission"
+            : "\(sessionId).\(requestId).permission"
+        let permFile = "\(sessionsDir)/\(filename)"
         if decision == "terminal" {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
                 try? FileManager.default.removeItem(atPath: permFile)
@@ -1189,12 +1321,42 @@ class SessionReader: ObservableObject {
         } else {
             try? FileManager.default.removeItem(atPath: permFile)
         }
+        return true
+    }
+
+    private func removePermissionFiles(sessionId: String) {
+        guard let files = try? FileManager.default.contentsOfDirectory(atPath: sessionsDir) else { return }
+        let prefix = "\(sessionId)."
+        for file in files where file == "\(sessionId).permission"
+            || (file.hasPrefix(prefix) && file.hasSuffix(".permission")) {
+            try? FileManager.default.removeItem(atPath: "\(sessionsDir)/\(file)")
+        }
     }
 
     /// Remove session files whose TTY no longer has any processes (terminal tab closed)
     func pruneDeadSessions() {
         let currentSessions = sessions
         guard !currentSessions.isEmpty else { return }
+
+        // Age-based prune for finished sessions the TTY/pane logic below can never
+        // reclaim. Two kinds qualify. Codex writes one file per thread
+        // (codex-<thread_id>), but many threads share a single terminal tab, so
+        // liveness alone never frees them — the tab stays open for days. And
+        // anything spawned from a GUI app rather than a terminal (Tugboat asking
+        // `claude -p` for a port description) has no terminal_session_id at all, so
+        // the maps below skip it entirely and one missed SessionEnd strands the
+        // file forever. Both age out on the same clock.
+        let staleMaxAge: TimeInterval = 24 * 60 * 60
+        for session in currentSessions where session.status == "done"
+            && (session.agent == "codex" || session.terminal_session_id.isEmpty) {
+            guard let updated = session.updatedAtDate,
+                  Date().timeIntervalSince(updated) > staleMaxAge else { continue }
+            let path = "\(sessionsDir)/\(session.session_id).json"
+            _ = try? SessionFileStore.remove(at: URL(fileURLWithPath: path))
+            removePermissionFiles(sessionId: session.session_id)
+            NSLog("[AgentMonitor] Pruned session %@ (%@) — done >24h ago, no terminal to reclaim it",
+                  session.session_id, session.agent)
+        }
 
         // Build map: ttyName -> [session_id]
         var ttyMap: [String: [String]] = [:]
@@ -1253,9 +1415,9 @@ class SessionReader: ObservableObject {
                     if let sids = ttyMap[tty] {
                         for sid in sids {
                             let path = "\(self.sessionsDir)/\(sid).json"
-                            try? FileManager.default.removeItem(atPath: path)
+                            _ = try? SessionFileStore.remove(at: URL(fileURLWithPath: path))
                             // Clean up orphaned permission files
-                            try? FileManager.default.removeItem(atPath: "\(self.sessionsDir)/\(sid).permission")
+                            self.removePermissionFiles(sessionId: sid)
                             NSLog("[AgentMonitor] Pruned session %@ — TTY %@ gone", sid, tty)
                         }
                     }
@@ -1283,8 +1445,8 @@ class SessionReader: ObservableObject {
                         if !livePanes.contains(paneId) {
                             for sid in sids {
                                 let path = "\(self.sessionsDir)/\(sid).json"
-                                try? FileManager.default.removeItem(atPath: path)
-                                try? FileManager.default.removeItem(atPath: "\(self.sessionsDir)/\(sid).permission")
+                                _ = try? SessionFileStore.remove(at: URL(fileURLWithPath: path))
+                                self.removePermissionFiles(sessionId: sid)
                                 NSLog("[AgentMonitor] Pruned session %@ — WezTerm pane %@ gone", sid, paneId)
                             }
                         }
@@ -1326,8 +1488,8 @@ class SessionReader: ObservableObject {
                     if !liveItermIds.contains(uniqueId) {
                         for sid in sids {
                             let path = "\(self.sessionsDir)/\(sid).json"
-                            try? FileManager.default.removeItem(atPath: path)
-                            try? FileManager.default.removeItem(atPath: "\(self.sessionsDir)/\(sid).permission")
+                            _ = try? SessionFileStore.remove(at: URL(fileURLWithPath: path))
+                            self.removePermissionFiles(sessionId: sid)
                             NSLog("[AgentMonitor] Pruned session %@ — iTerm2 session %@ gone", sid, uniqueId)
                         }
                     }
@@ -1358,7 +1520,7 @@ class SessionReader: ObservableObject {
         }
 
         var loaded: [SessionInfo] = []
-        var loadedPerms: [String: PermissionInfo] = [:]
+        var loadedPerms: [String: [PermissionInfo]] = [:]
 
         for file in files {
             if file.hasSuffix(".json") {
@@ -1369,13 +1531,27 @@ class SessionReader: ObservableObject {
                     loaded.append(session)
                 } catch {
                     NSLog("[AgentMonitor] Failed to decode %@: %@", file, error.localizedDescription)
+                    _ = try? SessionFileStore.quarantine(at: URL(fileURLWithPath: path))
                 }
             } else if file.hasSuffix(".permission") {
-                let sessionId = String(file.dropLast(".permission".count))
+                let legacySessionId = String(file.dropLast(".permission".count)).split(separator: ".").first.map(String.init) ?? ""
                 let path = "\(sessionsDir)/\(file)"
                 guard let data = fm.contents(atPath: path) else { continue }
-                if let perm = try? JSONDecoder().decode(PermissionInfo.self, from: data) {
-                    loadedPerms[sessionId] = perm
+                if let decoded = try? JSONDecoder().decode(PermissionInfo.self, from: data) {
+                    let sessionId = decoded.session_id.isEmpty ? legacySessionId : decoded.session_id
+                    let requestId = decoded.request_id.isEmpty ? sessionId : decoded.request_id
+                    let permission = PermissionInfo(
+                        requestId: requestId,
+                        sessionId: sessionId,
+                        toolName: decoded.tool_name,
+                        display: decoded.display,
+                        toolInput: decoded.tool_input,
+                        timestamp: decoded.timestamp,
+                        pid: decoded.pid
+                    )
+                    loadedPerms[sessionId, default: []].append(permission)
+                } else {
+                    _ = try? SessionFileStore.quarantine(at: URL(fileURLWithPath: path))
                 }
             }
         }
@@ -1384,14 +1560,8 @@ class SessionReader: ObservableObject {
         let order: [String: Int] = ["attention": 0, "working": 1, "starting": 2, "done": 3]
         loaded.sort { (order[$0.status] ?? 9) < (order[$1.status] ?? 9) }
 
-        let activeSessionIds = Set(loaded.map(\.session_id))
-        loadedPerms = loadedPerms.filter { activeSessionIds.contains($0.key) }
-
-        for orphanId in files
-            .filter({ $0.hasSuffix(".permission") })
-            .map({ String($0.dropLast(".permission".count)) })
-            .filter({ !activeSessionIds.contains($0) }) {
-            try? fm.removeItem(atPath: "\(sessionsDir)/\(orphanId).permission")
+        for sessionId in loadedPerms.keys {
+            loadedPerms[sessionId]?.sort { $0.timestamp < $1.timestamp }
         }
 
         DispatchQueue.main.async {
@@ -1431,31 +1601,21 @@ class SessionReader: ObservableObject {
 
             let sessionPath = "\(sessionsDir)/\(session.session_id).json"
             let fileURL = URL(fileURLWithPath: sessionPath)
-            guard let data = try? Data(contentsOf: fileURL),
-                  var json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { continue }
-
-            json["status"] = snapshot.status
-            json["agent"] = "codex"
-            json["thread_id"] = session.thread_id
-            if !snapshot.updatedAt.isEmpty {
-                json["updated_at"] = snapshot.updatedAt
-            }
-            if !snapshot.lastPrompt.isEmpty {
-                json["last_prompt"] = snapshot.lastPrompt
-            }
-
-            guard let encoded = try? JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys]) else { continue }
-            let tmpURL = fileURL.appendingPathExtension("tmp")
             do {
-                try encoded.write(to: tmpURL)
-                if FileManager.default.fileExists(atPath: fileURL.path) {
-                    _ = try FileManager.default.replaceItemAt(fileURL, withItemAt: tmpURL)
-                } else {
-                    try FileManager.default.moveItem(at: tmpURL, to: fileURL)
+                let updated = try SessionFileStore.updateJSONObjectIfPresent(at: fileURL) { json in
+                    json["status"] = snapshot.status
+                    json["agent"] = "codex"
+                    json["thread_id"] = session.thread_id
+                    if !snapshot.updatedAt.isEmpty {
+                        json["updated_at"] = snapshot.updatedAt
+                    }
+                    if !snapshot.lastPrompt.isEmpty {
+                        json["last_prompt"] = snapshot.lastPrompt
+                    }
                 }
-                didUpdate = true
+                didUpdate = didUpdate || updated
             } catch {
-                try? FileManager.default.removeItem(at: tmpURL)
+                NSLog("[AgentMonitor] Codex session update failed for %@: %@", session.session_id, error.localizedDescription)
             }
         }
 
@@ -1483,13 +1643,59 @@ class SessionReader: ObservableObject {
         return nil
     }
 
+    /// Reads only the bytes appended since the last call. Every field below is
+    /// last-wins, so folding new lines into the previous snapshot is exactly
+    /// equivalent to re-parsing the whole file — just without the re-parse.
+    /// Callers must stay on scanQueue; `codexLogCursors` is not synchronized.
     private func readCodexLogSnapshot(at path: String) -> CodexLogSnapshot? {
-        guard let data = FileManager.default.contents(atPath: path),
-              let content = String(data: data, encoding: .utf8) else { return nil }
+        let attrs = try? FileManager.default.attributesOfItem(atPath: path)
+        let size = (attrs?[.size] as? NSNumber)?.uint64Value ?? 0
+        let mtime = (attrs?[.modificationDate] as? Date) ?? Date.distantPast
 
-        var status = "working"
-        var updatedAt = ""
-        var lastPrompt = ""
+        var cursor = codexLogCursors[path] ?? CodexLogCursor(offset: 0, mtime: .distantPast, snapshot: nil)
+
+        // Truncated or rotated underneath us — start over rather than parse garbage.
+        if size < cursor.offset {
+            cursor = CodexLogCursor(offset: 0, mtime: .distantPast, snapshot: nil)
+        }
+
+        // Nothing appended: hand back what we already parsed, at zero cost.
+        // This is the common case — most tracked sessions are already done.
+        if cursor.offset > 0 && size == cursor.offset && mtime == cursor.mtime {
+            return cursor.returnable
+        }
+
+        guard let handle = FileHandle(forReadingAtPath: path) else { return cursor.returnable }
+        defer { try? handle.close() }
+        if cursor.offset > 0 {
+            do { try handle.seek(toOffset: cursor.offset) } catch { return cursor.returnable }
+        }
+        guard let data = try? handle.readToEnd(), !data.isEmpty else {
+            cursor.mtime = mtime
+            codexLogCursors[path] = cursor
+            return cursor.returnable
+        }
+
+        // Only consume through the final newline; a half-written last line stays
+        // unconsumed and is picked up complete on a later tick.
+        guard let lastNewline = data.lastIndex(of: UInt8(ascii: "\n")) else {
+            cursor.mtime = mtime
+            codexLogCursors[path] = cursor
+            return cursor.returnable
+        }
+        let consumable = data[data.startIndex...lastNewline]
+        let consumedCount = UInt64(consumable.count)
+
+        guard let content = String(data: consumable, encoding: .utf8) else {
+            cursor.offset += consumedCount
+            cursor.mtime = mtime
+            codexLogCursors[path] = cursor
+            return cursor.returnable
+        }
+
+        var status = cursor.snapshot?.status ?? "working"
+        var updatedAt = cursor.snapshot?.updatedAt ?? ""
+        var lastPrompt = cursor.snapshot?.lastPrompt ?? ""
 
         for line in content.split(separator: "\n") {
             guard let lineData = line.data(using: .utf8),
@@ -1514,8 +1720,11 @@ class SessionReader: ObservableObject {
             }
         }
 
-        guard !updatedAt.isEmpty else { return nil }
-        return CodexLogSnapshot(status: status, updatedAt: updatedAt, lastPrompt: lastPrompt)
+        cursor.offset += consumedCount
+        cursor.mtime = mtime
+        cursor.snapshot = CodexLogSnapshot(status: status, updatedAt: updatedAt, lastPrompt: lastPrompt)
+        codexLogCursors[path] = cursor
+        return cursor.returnable
     }
 
     private func unambiguousCodexLogPath(in paths: [String]) -> String? {
@@ -1542,7 +1751,6 @@ class SessionReader: ObservableObject {
     func discoverSessions() {
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self = self else { return }
-            let fm = FileManager.default
             let now = ISO8601DateFormatter().string(from: Date())
 
             // --- Step 1: Build TTY → terminal info map ---
@@ -1770,14 +1978,14 @@ class SessionReader: ObservableObject {
 
                 guard let jsonData = try? JSONSerialization.data(withJSONObject: sessionData, options: [.prettyPrinted, .sortedKeys]) else { continue }
                 let sessionFile = "\(self.sessionsDir)/\(safeSid).json"
-                    let tmpFile = sessionFile + ".tmp"
                 do {
-                    try jsonData.write(to: URL(fileURLWithPath: tmpFile))
-                    try fm.moveItem(atPath: tmpFile, toPath: sessionFile)
-                    created += 1
-                    NSLog("[AgentMonitor] Discovered %@ session: %@ (%@) on %@ %@", candidate.agent, project, sid, candidate.terminalType, candidate.terminalSessionId)
+                    let object = try JSONSerialization.jsonObject(with: jsonData) as? [String: Any] ?? [:]
+                    if try SessionFileStore.createJSONObjectIfAbsent(object, at: URL(fileURLWithPath: sessionFile)) {
+                        created += 1
+                        NSLog("[AgentMonitor] Discovered %@ session: %@ (%@) on %@ %@", candidate.agent, project, sid, candidate.terminalType, candidate.terminalSessionId)
+                    }
                 } catch {
-                    try? fm.removeItem(atPath: tmpFile)
+                    NSLog("[AgentMonitor] Discovery persistence failed for %@: %@", sid, error.localizedDescription)
                 }
             }
 
@@ -1989,19 +2197,13 @@ func persistTerminalTarget(sessionId: String, terminal: String, terminalSessionI
     let home = FileManager.default.homeDirectoryForCurrentUser.path
     let sessionFile = "\(home)/.claude/monitor/sessions/\(sessionId).json"
     let fileURL = URL(fileURLWithPath: sessionFile)
-    guard let data = try? Data(contentsOf: fileURL),
-          var json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return }
-
-    json["terminal"] = terminal
-    json["terminal_session_id"] = terminalSessionId
-
-    guard let encoded = try? JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys]) else { return }
-    let tmpURL = fileURL.appendingPathExtension("tmp")
     do {
-        try encoded.write(to: tmpURL)
-        _ = try FileManager.default.replaceItemAt(fileURL, withItemAt: tmpURL)
+        _ = try SessionFileStore.updateJSONObjectIfPresent(at: fileURL) { json in
+            json["terminal"] = terminal
+            json["terminal_session_id"] = terminalSessionId
+        }
     } catch {
-        try? FileManager.default.removeItem(at: tmpURL)
+        NSLog("[AgentMonitor] Failed to persist terminal target for %@: %@", sessionId, error.localizedDescription)
     }
 }
 
@@ -2207,7 +2409,7 @@ func killSession(_ session: SessionInfo) {
     let home = FileManager.default.homeDirectoryForCurrentUser.path
     let sessionFile = "\(home)/.claude/monitor/sessions/\(session.session_id).json"
     DispatchQueue.global().asyncAfter(deadline: .now() + 3) {
-        try? FileManager.default.removeItem(atPath: sessionFile)
+        _ = try? SessionFileStore.remove(at: URL(fileURLWithPath: sessionFile))
     }
 }
 
@@ -2371,8 +2573,9 @@ struct PermissionActionView: View {
             // Action buttons
             HStack(spacing: 8) {
                 Button {
-                    responding = "allow"
-                    reader.respondToPermission(sessionId: sessionId, decision: "allow")
+                    if reader.respondToPermission(sessionId: sessionId, requestId: permission.request_id, decision: "allow") {
+                        responding = "allow"
+                    }
                 } label: {
                     HStack(spacing: 3) {
                         Image(systemName: "checkmark")
@@ -2392,8 +2595,9 @@ struct PermissionActionView: View {
                 .buttonStyle(.plain)
 
                 Button {
-                    responding = "deny"
-                    reader.respondToPermission(sessionId: sessionId, decision: "deny")
+                    if reader.respondToPermission(sessionId: sessionId, requestId: permission.request_id, decision: "deny") {
+                        responding = "deny"
+                    }
                 } label: {
                     HStack(spacing: 3) {
                         Image(systemName: "xmark")
@@ -2413,9 +2617,10 @@ struct PermissionActionView: View {
                 .buttonStyle(.plain)
 
                 Button {
-                    responding = "terminal"
-                    reader.respondToPermission(sessionId: sessionId, decision: "terminal")
-                    onTerminal()
+                    if reader.respondToPermission(sessionId: sessionId, requestId: permission.request_id, decision: "terminal") {
+                        responding = "terminal"
+                        onTerminal()
+                    }
                 } label: {
                     HStack(spacing: 3) {
                         Image(systemName: "arrow.right.square")
@@ -3447,7 +3652,7 @@ struct MonitorContentView: View {
             // Header — always visible, drag to move
             HeaderBar(sessions: reader.sessions, configManager: configManager, usageFetcher: usageFetcher, sessionReader: reader, isExpanded: $isExpanded)
 
-            if isExpanded && !reader.sessions.isEmpty {
+            if isExpanded && (!reader.sessions.isEmpty || !reader.permissions.isEmpty) {
                 Divider()
                     .background(skin.colors.divider)
 
@@ -3462,7 +3667,7 @@ struct MonitorContentView: View {
                             }
                             .buttonStyle(.plain)
 
-                            if let perm = reader.permissions[session.id] {
+                            ForEach(reader.permissions[session.id] ?? []) { perm in
                                 PermissionActionView(
                                     permission: perm,
                                     sessionId: session.id,
@@ -3475,6 +3680,18 @@ struct MonitorContentView: View {
                                 Divider()
                                     .background(skin.colors.divider.opacity(0.5))
                                     .padding(.leading, 15)
+                            }
+                        }
+
+                        let knownSessionIds = Set(reader.sessions.map(\.id))
+                        ForEach(reader.permissions.keys.filter { !knownSessionIds.contains($0) }.sorted(), id: \.self) { sessionId in
+                            ForEach(reader.permissions[sessionId] ?? []) { perm in
+                                PermissionActionView(
+                                    permission: perm,
+                                    sessionId: sessionId,
+                                    reader: reader,
+                                    onTerminal: {}
+                                )
                             }
                         }
                     }
@@ -3836,6 +4053,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        PermissionSocketServer.shared.stop()
         instanceLock.release()
     }
 

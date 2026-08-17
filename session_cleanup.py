@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 
-import json
 import os
 import sys
 import time
+from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from session_store import remove_if_done
 
 
 def main() -> int:
@@ -16,18 +20,10 @@ def main() -> int:
     if not os.path.exists(session_file):
         return 0
 
-    try:
-        with open(session_file, "r", encoding="utf-8") as handle:
-            session = json.load(handle)
-    except Exception:
-        return 0
-
-    if session.get("status") == "done" and session.get("updated_at") == done_updated_at:
-        for path in (session_file, permission_file):
-            try:
-                os.remove(path)
-            except FileNotFoundError:
-                pass
+    if remove_if_done(Path(session_file), done_updated_at):
+        permission_path = Path(permission_file)
+        for path in permission_path.parent.glob(f"{permission_path.stem}*.permission"):
+            path.unlink(missing_ok=True)
 
     return 0
 

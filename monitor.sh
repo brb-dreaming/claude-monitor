@@ -11,12 +11,25 @@ set -euo pipefail
 EVENT="${1:-unknown}"
 INPUT=$(cat)
 
+# --- Opt-out ---
+# A caller that spawns `claude -p` as an implementation detail (Tugboat asking
+# for a port description, say) is not a session b wants to watch. It sets
+# AGENT_MONITOR_IGNORE=1 and we write nothing at all — better than writing a row
+# and cleaning it up later, because a GUI-spawned session has no TTY, so if its
+# SessionEnd is ever missed nothing in the panel can reclaim the file.
+if [ "${AGENT_MONITOR_IGNORE:-0}" != "0" ]; then
+    exit 0
+fi
+
 # --- Paths ---
-MONITOR_DIR="$HOME/.claude/monitor"
+MONITOR_DIR="${AGENT_MONITOR_DIR:-${CLAUDE_MONITOR_DIR:-$HOME/.claude/monitor}}"
 SESSIONS_DIR="$MONITOR_DIR/sessions"
 CONFIG_FILE="$MONITOR_DIR/config.json"
+HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
+SESSION_STORE="$HOOK_DIR/session_store.py"
 
-mkdir -p "$SESSIONS_DIR"
+mkdir -p -m 700 "$SESSIONS_DIR"
+chmod 700 "$SESSIONS_DIR"
 
 # --- Extract context from hook JSON ---
 SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty')
@@ -237,22 +250,29 @@ TERM_INFO=$(detect_terminal)
 TERM_APP=$(echo "$TERM_INFO" | cut -d'|' -f1)
 TERM_SID=$(echo "$TERM_INFO" | cut -d'|' -f2)
 
-# Helper: backfill terminal info + update status on existing session file
-update_session() {
+# Apply one lifecycle transition while holding the cross-process session lock.
+persist_session() {
     local new_status="$1"
-    jq \
-        --arg status "$new_status" \
-        --arg updated "$NOW" \
-        --arg terminal "$TERM_APP" \
-        --arg term_sid "$TERM_SID" \
-        --arg agent "$AGENT" \
-        --arg thread_id "$THREAD_ID" \
-        '.status = $status
-        | .updated_at = $updated
-        | if (.agent // "") == "" then .agent = $agent else . end
-        | if $thread_id != "" and (.thread_id // "") == "" then .thread_id = $thread_id else . end
-        | if .terminal == "" or ($terminal != "" and .terminal != $terminal) then .terminal = $terminal | .terminal_session_id = $term_sid else . end' \
-        "$SESSION_FILE" > "${SESSION_FILE}.tmp" && mv "${SESSION_FILE}.tmp" "$SESSION_FILE"
+    local prompt="${2:-}"
+    local set_prompt="${3:-0}"
+    local args=(
+        apply-event
+        --file "$SESSION_FILE"
+        --session-id "$SESSION_ID"
+        --agent "$AGENT"
+        --thread-id "$THREAD_ID"
+        --status "$new_status"
+        --project "$PROJECT"
+        --cwd "${CWD:-}"
+        --terminal "$TERM_APP"
+        --terminal-session-id "$TERM_SID"
+        --updated-at "$NOW"
+        --last-prompt "$prompt"
+    )
+    if [ "$set_prompt" = "1" ]; then
+        args+=(--set-prompt)
+    fi
+    python3 "$SESSION_STORE" "${args[@]}"
 }
 
 schedule_session_removal() {
@@ -278,36 +298,7 @@ subprocess.Popen(
 PY
 }
 
-# Helper: create new session file
-create_session() {
-    local new_status="$1"
-    local prompt="${2:-}"
-    jq -n \
-        --arg sid "$SESSION_ID" \
-        --arg agent "$AGENT" \
-        --arg thread_id "$THREAD_ID" \
-        --arg status "$new_status" \
-        --arg project "$PROJECT" \
-        --arg cwd "${CWD:-}" \
-        --arg terminal "$TERM_APP" \
-        --arg term_sid "$TERM_SID" \
-        --arg started "$NOW" \
-        --arg updated "$NOW" \
-        --arg prompt "$prompt" \
-        '{
-            session_id:$sid,
-            agent:$agent,
-            status:$status,
-            project:$project,
-            cwd:$cwd,
-            terminal:$terminal,
-            terminal_session_id:$term_sid,
-            started_at:$started,
-            updated_at:$updated,
-            last_prompt:$prompt
-        } + (if $thread_id != "" then {thread_id:$thread_id} else {} end)' \
-        > "${SESSION_FILE}.tmp" && mv "${SESSION_FILE}.tmp" "$SESSION_FILE"
-
+cleanup_discovered_session() {
     # Clean up any discovered-*.json for the same terminal session (discovery→hook handoff)
     # Handles format differences: iTerm2 discovery stores "GUID", hooks store "w0t0p0:GUID"
     if [ -n "$TERM_SID" ]; then
@@ -335,45 +326,31 @@ ensure_monitor_running
 # --- Handle events ---
 case "$EVENT" in
     SessionStart)
-        create_session "starting"
+        persist_session "starting"
+        cleanup_discovered_session
         if should_announce start; then
-            announce "$(announcement_text start)"
+            announce "$(announcement_text start)" </dev/null >/dev/null 2>&1 &
+            disown 2>/dev/null || true
         fi
         ;;
 
     UserPromptSubmit)
         PROMPT_TEXT=$(echo "$INPUT" | jq -r '.prompt // empty' | head -c 200)
-        if [ -f "$SESSION_FILE" ]; then
-            # Single atomic write: status + prompt + terminal backfill
-            jq \
-                --arg status "working" \
-                --arg updated "$NOW" \
-                --arg prompt "$PROMPT_TEXT" \
-                --arg terminal "$TERM_APP" \
-                --arg term_sid "$TERM_SID" \
-                --arg agent "$AGENT" \
-                --arg thread_id "$THREAD_ID" \
-                '.status = $status
-                | .updated_at = $updated
-                | .last_prompt = $prompt
-                | if (.agent // "") == "" then .agent = $agent else . end
-                | if $thread_id != "" and (.thread_id // "") == "" then .thread_id = $thread_id else . end
-                | if .terminal == "" or ($terminal != "" and .terminal != $terminal) then .terminal = $terminal | .terminal_session_id = $term_sid else . end' \
-                "$SESSION_FILE" > "${SESSION_FILE}.tmp" && mv "${SESSION_FILE}.tmp" "$SESSION_FILE"
-        else
-            create_session "working" "$PROMPT_TEXT"
-        fi
+        persist_session "working" "$PROMPT_TEXT" 1
+        cleanup_discovered_session
         ;;
 
     Stop)
         should_schedule_removal="$AUTOCLEAN_DONE"
-        if [ -f "$SESSION_FILE" ]; then
-            update_session "done"
+        PROMPT_TEXT=$(printf '%s' "$INPUT" | jq -r '.prompt // empty' | head -c 200)
+        if [ -n "$PROMPT_TEXT" ]; then
+            persist_session "done" "$PROMPT_TEXT" 1
         else
-            create_session "done"
+            persist_session "done"
         fi
         if should_announce done; then
-            announce "$(announcement_text done)"
+            announce "$(announcement_text done)" </dev/null >/dev/null 2>&1 &
+            disown 2>/dev/null || true
         fi
         if [ "$should_schedule_removal" = "1" ]; then
             schedule_session_removal "$SESSION_FILE" "$SESSION_ID" "$NOW"
@@ -381,21 +358,17 @@ case "$EVENT" in
         ;;
 
     Notification)
-        if [ -f "$SESSION_FILE" ]; then
-            update_session "attention"
-        else
-            create_session "attention"
-        fi
+        persist_session "attention"
         # Only announce if PermissionRequest isn't actively handling this
-        PERM_FILE="$SESSIONS_DIR/${SESSION_ID}.permission"
-        if [ ! -f "$PERM_FILE" ] && should_announce attention; then
-            announce "$(announcement_text attention)"
+        if ! compgen -G "$SESSIONS_DIR/${SESSION_ID}*.permission" >/dev/null && should_announce attention; then
+            announce "$(announcement_text attention)" </dev/null >/dev/null 2>&1 &
+            disown 2>/dev/null || true
         fi
         ;;
 
     SessionEnd)
         if [ -f "$SESSION_FILE" ]; then
-            update_session "done"
+            persist_session "done"
             schedule_session_removal "$SESSION_FILE" "$SESSION_ID" "$NOW"
         fi
         ;;
