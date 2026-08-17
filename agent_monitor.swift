@@ -1183,18 +1183,23 @@ func currentWezTermSocket() -> String? {
     return newest?.path
 }
 
-/// Create a Process configured to run `wezterm cli` with the current socket.
-func wezTermCLIProcess(arguments: [String]) -> Process {
-    let task = Process()
-    task.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-    task.arguments = ["wezterm", "cli"] + arguments
-    task.standardError = FileHandle.nullDevice
-    // Override WEZTERM_UNIX_SOCKET so we connect to the live WezTerm instance,
-    // not whatever socket was in effect when the monitor was launched.
-    var env = ProcessInfo.processInfo.environment
-    if let sock = currentWezTermSocket() { env["WEZTERM_UNIX_SOCKET"] = sock }
-    task.environment = env
-    return task
+/// Environment used for `wezterm cli` with the current socket.
+func wezTermEnvironment() -> [String: String] {
+    var environment = ProcessInfo.processInfo.environment
+    if let socket = currentWezTermSocket() {
+        environment["WEZTERM_UNIX_SOCKET"] = socket
+    }
+    return environment
+}
+
+func runWezTermCLI(arguments: [String], timeout: TimeInterval = 3) -> ProcessResult? {
+    try? ProcessRunner.run(
+        executableURL: URL(fileURLWithPath: "/usr/bin/env"),
+        arguments: ["wezterm", "cli"] + arguments,
+        environment: wezTermEnvironment(),
+        timeout: timeout,
+        maximumOutputBytes: 512 * 1024
+    )
 }
 
 // MARK: - Session Reader (polls directory)
@@ -1207,6 +1212,8 @@ class SessionReader: ObservableObject {
     private var discoveryTimer: Timer?
     private var codexSyncTimer: Timer?
     private var isPruning = false
+    private var isDiscovering = false
+    private let discoveryLock = NSLock()
     private let scanQueue = DispatchQueue(label: "monitor.sessions.scan", qos: .utility)
     private var sessionsDirFD: CInt = -1
     private var sessionsWatcher: DispatchSourceFileSystemObject?
@@ -1393,48 +1400,36 @@ class SessionReader: ObservableObject {
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self = self else { return }
 
-            // Single shell command checks all TTYs at once
-            let ttys = ttyMap.keys.joined(separator: " ")
-            let script = "for tty in \(ttys); do ps -t \"$tty\" -o pid= 2>/dev/null | head -1 | grep -q . || echo \"$tty\"; done"
+            var deadTTYs = Set<String>()
+            for tty in ttyMap.keys {
+                guard let result = try? ProcessRunner.run(
+                    executableURL: URL(fileURLWithPath: "/bin/ps"),
+                    arguments: ["-t", tty, "-o", "pid="],
+                    timeout: 2,
+                    maximumOutputBytes: 64 * 1024
+                ), !result.timedOut else { continue }
+                let output = (String(data: result.standardOutput, encoding: .utf8) ?? "")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if output.isEmpty { deadTTYs.insert(tty) }
+            }
 
-            let task = Process()
-            task.executableURL = URL(fileURLWithPath: "/bin/sh")
-            task.arguments = ["-c", script]
-            let pipe = Pipe()
-            task.standardOutput = pipe
-            task.standardError = FileHandle.nullDevice
-
-            do {
-                try task.run()
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                task.waitUntilExit()
-                let output = String(data: data, encoding: .utf8) ?? ""
-                let deadTTYs = Set(output.split(separator: "\n").map(String.init))
-
-                for tty in deadTTYs {
-                    if let sids = ttyMap[tty] {
-                        for sid in sids {
-                            let path = "\(self.sessionsDir)/\(sid).json"
-                            _ = try? SessionFileStore.remove(at: URL(fileURLWithPath: path))
-                            // Clean up orphaned permission files
-                            self.removePermissionFiles(sessionId: sid)
-                            NSLog("[AgentMonitor] Pruned session %@ — TTY %@ gone", sid, tty)
-                        }
+            for tty in deadTTYs {
+                if let sids = ttyMap[tty] {
+                    for sid in sids {
+                        let path = "\(self.sessionsDir)/\(sid).json"
+                        _ = try? SessionFileStore.remove(at: URL(fileURLWithPath: path))
+                        self.removePermissionFiles(sessionId: sid)
+                        NSLog("[AgentMonitor] Pruned session %@ — TTY %@ gone", sid, tty)
                     }
                 }
-            } catch {}
+            }
 
             // Prune dead WezTerm panes
             if !wezPaneMap.isEmpty {
-                let wezTask = wezTermCLIProcess(arguments: ["list", "--format", "json"])
-                let wezPipe = Pipe()
-                wezTask.standardOutput = wezPipe
-                do {
-                    try wezTask.run()
-                    let wezData = wezPipe.fileHandleForReading.readDataToEndOfFile()
-                    wezTask.waitUntilExit()
+                if let result = runWezTermCLI(arguments: ["list", "--format", "json"]),
+                   result.succeeded {
                     var livePanes = Set<String>()
-                    if let panes = try? JSONSerialization.jsonObject(with: wezData) as? [[String: Any]] {
+                    if let panes = try? JSONSerialization.jsonObject(with: result.standardOutput) as? [[String: Any]] {
                         for pane in panes {
                             if let paneId = pane["pane_id"] as? Int {
                                 livePanes.insert(String(paneId))
@@ -1451,7 +1446,7 @@ class SessionReader: ObservableObject {
                             }
                         }
                     }
-                } catch {}
+                }
             }
 
             // Prune dead iTerm2 sessions
@@ -1749,8 +1744,21 @@ class SessionReader: ObservableObject {
     /// Builds a TTY→terminal map from WezTerm/iTerm2, finds supported agents via ps, resolves cwd via lsof,
     /// and creates session files for any that aren't already tracked. Skips cwd=/ (launcher process artifact).
     func discoverSessions() {
+        discoveryLock.lock()
+        guard !isDiscovering else {
+            discoveryLock.unlock()
+            return
+        }
+        isDiscovering = true
+        discoveryLock.unlock()
+
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self = self else { return }
+            defer {
+                self.discoveryLock.lock()
+                self.isDiscovering = false
+                self.discoveryLock.unlock()
+            }
             let now = ISO8601DateFormatter().string(from: Date())
 
             // --- Step 1: Build TTY → terminal info map ---
@@ -1758,13 +1766,9 @@ class SessionReader: ObservableObject {
             var ttyTerminalMap: [String: (String, String)] = [:]
 
             // WezTerm: pane_id + tty_name
-            let wezTask = wezTermCLIProcess(arguments: ["list", "--format", "json"])
-            let wezPipe = Pipe()
-            wezTask.standardOutput = wezPipe
-            if let _ = try? wezTask.run() {
-                let wezData = wezPipe.fileHandleForReading.readDataToEndOfFile()
-                wezTask.waitUntilExit()
-                if let panes = try? JSONSerialization.jsonObject(with: wezData) as? [[String: Any]] {
+            if let result = runWezTermCLI(arguments: ["list", "--format", "json"]),
+               result.succeeded {
+                if let panes = try? JSONSerialization.jsonObject(with: result.standardOutput) as? [[String: Any]] {
                     for pane in panes {
                         if let paneId = pane["pane_id"] as? Int,
                            let ttyName = pane["tty_name"] as? String, !ttyName.isEmpty {
@@ -1825,16 +1829,13 @@ class SessionReader: ObservableObject {
 
             // --- Step 3: Find supported agent processes with TTYs ---
             // Use comm= so each row has a stable executable name/path without argv noise.
-            let psTask = Process()
-            let psPipe = Pipe()
-            psTask.executableURL = URL(fileURLWithPath: "/bin/sh")
-            psTask.arguments = ["-c", "ps -eo pid=,tty=,comm= | awk '($3 == \"claude\" || $3 == \"codex\" || $3 ~ /\\/codex$/) && $3 !~ /agent_monitor$/ {print $1 \"\\t\" $2 \"\\t\" $3}'"]
-            psTask.standardOutput = psPipe
-            psTask.standardError = FileHandle.nullDevice
-            guard let _ = try? psTask.run() else { return }
-            let psData = psPipe.fileHandleForReading.readDataToEndOfFile()
-            psTask.waitUntilExit()
-            let psOutput = String(data: psData, encoding: .utf8) ?? ""
+            guard let psResult = try? ProcessRunner.run(
+                executableURL: URL(fileURLWithPath: "/bin/ps"),
+                arguments: ["-eo", "pid=,tty=,comm="],
+                timeout: 3,
+                maximumOutputBytes: 512 * 1024
+            ), psResult.succeeded else { return }
+            let psOutput = String(data: psResult.standardOutput, encoding: .utf8) ?? ""
 
             struct CandidateProcess {
                 let pid: String
@@ -1846,11 +1847,11 @@ class SessionReader: ObservableObject {
             var seenTTYs = Set<String>() // only take one tracked agent process per TTY
 
             for line in psOutput.split(separator: "\n") {
-                let parts = line.split(separator: "\t")
-                guard parts.count >= 3 else { continue }
-                let pid = String(parts[0]).trimmingCharacters(in: .whitespaces)
-                let ttyShort = String(parts[1]).trimmingCharacters(in: .whitespaces)
-                let comm = String(parts[2]).trimmingCharacters(in: .whitespaces)
+                let parts = line.split(maxSplits: 2, whereSeparator: \.isWhitespace)
+                guard parts.count == 3 else { continue }
+                let pid = String(parts[0])
+                let ttyShort = String(parts[1])
+                let comm = URL(fileURLWithPath: String(parts[2])).lastPathComponent
 
                 let agent: String
                 if comm == "claude" {
@@ -1912,16 +1913,13 @@ class SessionReader: ObservableObject {
 
             // --- Step 5: Batch-resolve cwds and Codex session logs via single lsof call ---
             let pidList = filteredCandidates.map { $0.pid }.joined(separator: ",")
-            let lsofTask = Process()
-            let lsofPipe = Pipe()
-            lsofTask.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
-            lsofTask.arguments = ["-p", pidList, "-Fnf"]
-            lsofTask.standardOutput = lsofPipe
-            lsofTask.standardError = FileHandle.nullDevice
-            guard let _ = try? lsofTask.run() else { return }
-            let lsofData = lsofPipe.fileHandleForReading.readDataToEndOfFile()
-            lsofTask.waitUntilExit()
-            let lsofOutput = String(data: lsofData, encoding: .utf8) ?? ""
+            guard let lsofResult = try? ProcessRunner.run(
+                executableURL: URL(fileURLWithPath: "/usr/sbin/lsof"),
+                arguments: ["-p", pidList, "-Fnf"],
+                timeout: 3,
+                maximumOutputBytes: 512 * 1024
+            ), !lsofResult.timedOut else { return }
+            let lsofOutput = String(data: lsofResult.standardOutput, encoding: .utf8) ?? ""
 
             // Parse multi-process lsof output: "p<PID>\nf<fd>\nn<path>\np<PID>\n..."
             var pidToCwd: [String: String] = [:]
@@ -2009,13 +2007,9 @@ struct TerminalTarget {
 func currentTerminalTargetsByTTY() -> [String: TerminalTarget] {
     var ttyTerminalMap: [String: TerminalTarget] = [:]
 
-    let wezTask = wezTermCLIProcess(arguments: ["list", "--format", "json"])
-    let wezPipe = Pipe()
-    wezTask.standardOutput = wezPipe
-    if let _ = try? wezTask.run() {
-        let wezData = wezPipe.fileHandleForReading.readDataToEndOfFile()
-        wezTask.waitUntilExit()
-        if let panes = try? JSONSerialization.jsonObject(with: wezData) as? [[String: Any]] {
+    if let result = runWezTermCLI(arguments: ["list", "--format", "json"]),
+       result.succeeded {
+        if let panes = try? JSONSerialization.jsonObject(with: result.standardOutput) as? [[String: Any]] {
             for pane in panes {
                 if let paneId = pane["pane_id"] as? Int,
                    let ttyName = pane["tty_name"] as? String, !ttyName.isEmpty {
@@ -2073,16 +2067,15 @@ func codexLogPath(for threadID: String) -> String? {
 }
 
 func resolveTTYPath(forPid pid: String) -> String? {
-    let task = Process()
-    let pipe = Pipe()
-    task.executableURL = URL(fileURLWithPath: "/bin/sh")
-    task.arguments = ["-c", "ps -o tty= -p \(pid) 2>/dev/null"]
-    task.standardOutput = pipe
-    task.standardError = FileHandle.nullDevice
-    guard let _ = try? task.run() else { return nil }
-    let data = pipe.fileHandleForReading.readDataToEndOfFile()
-    task.waitUntilExit()
-    let ttyShort = (String(data: data, encoding: .utf8) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !pid.isEmpty, pid.allSatisfy(\.isNumber),
+          let result = try? ProcessRunner.run(
+            executableURL: URL(fileURLWithPath: "/bin/ps"),
+            arguments: ["-o", "tty=", "-p", pid],
+            timeout: 2,
+            maximumOutputBytes: 4096
+          ), result.succeeded else { return nil }
+    let ttyShort = (String(data: result.standardOutput, encoding: .utf8) ?? "")
+        .trimmingCharacters(in: .whitespacesAndNewlines)
     guard !ttyShort.isEmpty, ttyShort != "??" else { return nil }
     let sanitized = ttyShort.filter { $0.isLetter || $0.isNumber }
     guard sanitized == ttyShort else { return nil }
@@ -2092,17 +2085,14 @@ func resolveTTYPath(forPid pid: String) -> String? {
 func resolveLiveCodexTarget(threadID: String) -> TerminalTarget? {
     guard let logPath = codexLogPath(for: threadID) else { return nil }
 
-    let lsofTask = Process()
-    let lsofPipe = Pipe()
-    lsofTask.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
-    lsofTask.arguments = ["-t", logPath]
-    lsofTask.standardOutput = lsofPipe
-    lsofTask.standardError = FileHandle.nullDevice
-    guard let _ = try? lsofTask.run() else { return nil }
-    let lsofData = lsofPipe.fileHandleForReading.readDataToEndOfFile()
-    lsofTask.waitUntilExit()
+    guard let lsofResult = try? ProcessRunner.run(
+        executableURL: URL(fileURLWithPath: "/usr/sbin/lsof"),
+        arguments: ["-t", logPath],
+        timeout: 3,
+        maximumOutputBytes: 64 * 1024
+    ), !lsofResult.timedOut else { return nil }
 
-    let pids = Set((String(data: lsofData, encoding: .utf8) ?? "")
+    let pids = Set((String(data: lsofResult.standardOutput, encoding: .utf8) ?? "")
         .split(separator: "\n")
         .map { String($0).trimmingCharacters(in: .whitespaces) }
         .filter { !$0.isEmpty })
@@ -2119,24 +2109,13 @@ func resolveLiveCodexTarget(threadID: String) -> TerminalTarget? {
 func resolveLiveTarget(agent: String, cwd: String) -> TerminalTarget? {
     guard !cwd.isEmpty else { return nil }
 
-    let agentPattern: String
-    switch agent {
-    case "codex":
-        agentPattern = "($3 == \"codex\" || $3 ~ /\\/codex$/)"
-    default:
-        agentPattern = "($3 == \"claude\")"
-    }
-
-    let psTask = Process()
-    let psPipe = Pipe()
-    psTask.executableURL = URL(fileURLWithPath: "/bin/sh")
-    psTask.arguments = ["-c", "ps -eo pid=,tty=,comm= | awk '\(agentPattern) {print $1 \"\\t\" $2}'"]
-    psTask.standardOutput = psPipe
-    psTask.standardError = FileHandle.nullDevice
-    guard let _ = try? psTask.run() else { return nil }
-    let psData = psPipe.fileHandleForReading.readDataToEndOfFile()
-    psTask.waitUntilExit()
-    let psOutput = String(data: psData, encoding: .utf8) ?? ""
+    guard let psResult = try? ProcessRunner.run(
+        executableURL: URL(fileURLWithPath: "/bin/ps"),
+        arguments: ["-eo", "pid=,tty=,comm="],
+        timeout: 3,
+        maximumOutputBytes: 512 * 1024
+    ), psResult.succeeded else { return nil }
+    let psOutput = String(data: psResult.standardOutput, encoding: .utf8) ?? ""
 
     struct CandidateTTY {
         let pid: String
@@ -2145,10 +2124,14 @@ func resolveLiveTarget(agent: String, cwd: String) -> TerminalTarget? {
 
     var candidates: [CandidateTTY] = []
     for line in psOutput.split(separator: "\n") {
-        let parts = line.split(separator: "\t")
-        guard parts.count == 2 else { continue }
-        let pid = String(parts[0]).trimmingCharacters(in: .whitespaces)
-        let ttyShort = String(parts[1]).trimmingCharacters(in: .whitespaces)
+        let parts = line.split(maxSplits: 2, whereSeparator: \.isWhitespace)
+        guard parts.count == 3 else { continue }
+        let pid = String(parts[0])
+        let ttyShort = String(parts[1])
+        let command = String(parts[2])
+        let commandName = URL(fileURLWithPath: command).lastPathComponent
+        guard (agent == "codex" && commandName == "codex")
+            || (agent != "codex" && commandName == "claude") else { continue }
         guard !ttyShort.isEmpty, ttyShort != "??" else { continue }
         let sanitized = ttyShort.filter { $0.isLetter || $0.isNumber }
         guard sanitized == ttyShort else { continue }
@@ -2158,16 +2141,13 @@ func resolveLiveTarget(agent: String, cwd: String) -> TerminalTarget? {
     guard !candidates.isEmpty else { return nil }
 
     let pidList = candidates.map(\.pid).joined(separator: ",")
-    let lsofTask = Process()
-    let lsofPipe = Pipe()
-    lsofTask.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
-    lsofTask.arguments = ["-p", pidList, "-Fnf"]
-    lsofTask.standardOutput = lsofPipe
-    lsofTask.standardError = FileHandle.nullDevice
-    guard let _ = try? lsofTask.run() else { return nil }
-    let lsofData = lsofPipe.fileHandleForReading.readDataToEndOfFile()
-    lsofTask.waitUntilExit()
-    let lsofOutput = String(data: lsofData, encoding: .utf8) ?? ""
+    guard let lsofResult = try? ProcessRunner.run(
+        executableURL: URL(fileURLWithPath: "/usr/sbin/lsof"),
+        arguments: ["-p", pidList, "-Fnf"],
+        timeout: 3,
+        maximumOutputBytes: 512 * 1024
+    ), !lsofResult.timedOut else { return nil }
+    let lsofOutput = String(data: lsofResult.standardOutput, encoding: .utf8) ?? ""
 
     var pidToCwd: [String: String] = [:]
     var currentPid: String?
@@ -2222,27 +2202,37 @@ func switchToResolvedTarget(_ target: TerminalTarget, cwd: String) {
 
 func switchToSession(_ session: SessionInfo) {
     NSLog("[AgentMonitor] switchToSession: terminal=\(session.terminal) tty=\(session.terminal_session_id) project=\(session.project)")
-    if session.agent == "codex",
-       !session.thread_id.isEmpty,
-       let liveTarget = resolveLiveCodexTarget(threadID: session.thread_id) {
-        persistTerminalTarget(sessionId: session.session_id, terminal: liveTarget.terminal, terminalSessionId: liveTarget.sessionId)
-        switchToResolvedTarget(liveTarget, cwd: session.cwd)
-        return
-    }
+    DispatchQueue.global(qos: .userInitiated).async {
+        let resolved: TerminalTarget?
+        if session.agent == "codex", !session.thread_id.isEmpty,
+           let liveTarget = resolveLiveCodexTarget(threadID: session.thread_id) {
+            resolved = liveTarget
+        } else {
+            resolved = resolveLiveTarget(agent: session.agent, cwd: session.cwd)
+        }
 
-    if let liveTarget = resolveLiveTarget(agent: session.agent, cwd: session.cwd) {
-        persistTerminalTarget(sessionId: session.session_id, terminal: liveTarget.terminal, terminalSessionId: liveTarget.sessionId)
-        switchToResolvedTarget(liveTarget, cwd: session.cwd)
-        return
-    }
+        if let resolved {
+            persistTerminalTarget(
+                sessionId: session.session_id,
+                terminal: resolved.terminal,
+                terminalSessionId: resolved.sessionId
+            )
+        }
 
-    if !session.terminal_session_id.isEmpty {
-        switchToResolvedTarget(TerminalTarget(terminal: session.terminal, sessionId: session.terminal_session_id), cwd: session.cwd)
-        return
+        DispatchQueue.main.async {
+            if let resolved {
+                switchToResolvedTarget(resolved, cwd: session.cwd)
+            } else if !session.terminal_session_id.isEmpty {
+                switchToResolvedTarget(
+                    TerminalTarget(terminal: session.terminal, sessionId: session.terminal_session_id),
+                    cwd: session.cwd
+                )
+            } else {
+                NSLog("[AgentMonitor] falling back to cwd switch (no terminal info)")
+                switchByTerminalCwd(cwd: session.cwd)
+            }
+        }
     }
-
-    NSLog("[AgentMonitor] falling back to cwd switch (no terminal info)")
-    switchByTerminalCwd(cwd: session.cwd)
 }
 
 func switchToITerm2(sessionId: String) {
@@ -2289,9 +2279,9 @@ func switchToWezTerm(paneId: String) {
         app.activate()
     }
     // Focus the specific pane via wezterm CLI
-    let task = wezTermCLIProcess(arguments: ["activate-pane", "--pane-id", paneId])
-    task.standardOutput = FileHandle.nullDevice
-    try? task.run()
+    DispatchQueue.global(qos: .userInitiated).async {
+        _ = runWezTermCLI(arguments: ["activate-pane", "--pane-id", paneId])
+    }
 }
 
 func switchToTerminal(ttyPath: String) {
@@ -2335,19 +2325,21 @@ func switchByTerminalCwd(cwd: String) {
 // MARK: - Session Killer
 
 func killSession(_ session: SessionInfo) {
+    DispatchQueue.global(qos: .userInitiated).async {
+        killSessionInBackground(session)
+    }
+}
+
+private func killSessionInBackground(_ session: SessionInfo) {
     var ttyName: String?
 
     if session.terminal == "terminal" && !session.terminal_session_id.isEmpty {
         ttyName = session.terminal_session_id.replacingOccurrences(of: "/dev/", with: "")
     } else if session.terminal == "wezterm" && !session.terminal_session_id.isEmpty {
         // Get TTY from wezterm CLI for this pane
-        let task = wezTermCLIProcess(arguments: ["list", "--format", "json"])
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        try? task.run()
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        task.waitUntilExit()
-        if let panes = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
+        if let result = runWezTermCLI(arguments: ["list", "--format", "json"]),
+           result.succeeded,
+           let panes = try? JSONSerialization.jsonObject(with: result.standardOutput) as? [[String: Any]] {
             for pane in panes {
                 if let paneId = pane["pane_id"] as? Int, String(paneId) == session.terminal_session_id {
                     if let tty = pane["tty_name"] as? String {
@@ -2399,10 +2391,12 @@ func killSession(_ session: SessionInfo) {
             return
         }
         let processPattern = session.agent == "codex" ? "codex" : "claude"
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/bin/sh")
-        task.arguments = ["-c", "pkill -TERM -t \(sanitized) -f \(processPattern) 2>/dev/null"]
-        try? task.run()
+        _ = try? ProcessRunner.run(
+            executableURL: URL(fileURLWithPath: "/usr/bin/pkill"),
+            arguments: ["-TERM", "-t", sanitized, "-f", processPattern],
+            timeout: 3,
+            maximumOutputBytes: 4096
+        )
     }
 
     // Remove session file — user explicitly dismissed it

@@ -50,12 +50,17 @@ release CI remain deliberately staged work rather than risky in-place changes.
 
 ## P1 — Responsiveness and operational reliability
 
+**Status (2026-08-17): in progress.** The first subprocess/responsiveness slice
+is recorded in `p1-implementation.md`.
+
 ### 5. Centralize subprocess execution
 
-- Add async `ProcessRunner` with timeout, cancellation, output cap, exit status,
-  and typed errors.
-- Move terminal resolution/kill/discovery off the main actor.
-- Add single-flight discovery and terminate children at shutdown.
+- [x] Add `ProcessRunner` with timeout, output cap, exit status, typed launch
+  errors, and TERM→KILL escalation.
+- [x] Move terminal resolution and stop work off the main thread.
+- [x] Add single-flight discovery.
+- [ ] Add explicit cancellation handles and terminate all children at shutdown.
+- [ ] Add timeout isolation for AppleScript terminal bridges.
 
 ### 6. Make notifications non-blocking
 

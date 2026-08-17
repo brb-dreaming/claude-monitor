@@ -65,9 +65,9 @@ Check if it's running:
 pgrep -l agent_monitor
 ```
 
-Kill and rebuild:
+Gracefully stop and rebuild:
 ```bash
-pkill -9 agent_monitor && ~/.claude/monitor/build.sh
+pkill agent_monitor && ~/.claude/monitor/build.sh
 ```
 
 If compilation fails, make sure Xcode Command Line Tools are installed:
@@ -113,7 +113,7 @@ The Allow/Deny buttons require the `PermissionRequest` hook to be configured in 
       {
         "type": "command",
         "command": "python3 $HOME/.claude/hooks/monitor_permission.py",
-        "timeout": 86400
+        "timeout": 300
       }
     ]
   }
@@ -128,7 +128,11 @@ The monitor app communicates with the Python hook via a Unix socket at `~/.claud
 
 1. **Socket exists** — `ls -la ~/.claude/monitor/monitor.sock` (created when the monitor app launches)
 2. **Monitor app is running** — `pgrep -l agent_monitor`
-3. **Restart the app** — `pkill -9 agent_monitor && ~/.claude/monitor/build.sh`
+3. **Check ownership** — the socket should appear as `srw-------` (`0600`)
+4. **Restart the app** — `pkill agent_monitor && ~/.claude/monitor/build.sh`
+
+If a permission card appears just before its socket finishes registering, an
+early click intentionally leaves the card visible. Retry the same action once.
 
 If the socket doesn't exist, the monitor app failed to start its socket server. Check Console.app for `[AgentMonitor]` log messages.
 

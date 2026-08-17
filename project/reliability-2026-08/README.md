@@ -25,3 +25,4 @@ This directory tracks the August 2026 reliability and readiness review.
 - `external-contracts.md` — Claude Code and Codex integration assumptions.
 - `p0-baseline.md` — source and worktree state captured before remediation.
 - `p0-implementation.md` — P0 changes, verification, and remaining boundaries.
+- `p1-implementation.md` — incremental P1 responsiveness and operations work.

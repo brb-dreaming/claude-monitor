@@ -131,6 +131,11 @@ deduplication.
 
 ### AM-006 — Terminal resolution and kill operations block the UI thread
 
+**P1 status (2026-08-17): Partially addressed.** All command-line subprocesses
+now use the bounded `ProcessRunner`; row-click resolution and stop work execute
+off the main thread. AppleScript terminal bridges still need explicit timeout
+isolation, and stop/dismiss truthfulness remains AM-007.
+
 **Confidence:** Confirmed statically.
 
 **Evidence:** Row button handlers synchronously run `ps`, `lsof`, WezTerm CLI,
@@ -250,6 +255,11 @@ for the socket and runtime state. Fail closed with a visible diagnostic and a
 well-defined recovery path.
 
 ### AM-014 — Subprocess and discovery work lacks lifecycle control
+
+**P1 status (2026-08-17): Partially addressed.** Direct `Process` calls are
+centralized with deadlines, capped output, exit status, and TERM→KILL timeout
+handling. Discovery is single-flight. Explicit cancellation ownership at app
+shutdown and AppleScript deadlines remain open.
 
 Periodic discovery can overlap itself, most subprocesses lack deadlines, and
 errors are swallowed. Add single-flight guards, timeouts, cancellation on app
