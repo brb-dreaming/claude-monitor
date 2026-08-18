@@ -13,6 +13,8 @@ public struct ProcessResult: Equatable {
 
 public enum ProcessRunnerError: Error, Equatable {
     case launchFailed(String)
+    case terminationFailed(processIdentifier: Int32)
+    case outputDrainFailed
 }
 
 public enum ProcessRunner {
@@ -39,42 +41,58 @@ public enum ProcessRunner {
         process.standardError = standardError
         process.terminationHandler = { _ in completion.signal() }
 
-        standardOutput.fileHandleForReading.readabilityHandler = { handle in
-            capture.append(handle.availableData, toStandardError: false)
-        }
-        standardError.fileHandleForReading.readabilityHandler = { handle in
-            capture.append(handle.availableData, toStandardError: true)
-        }
+        let readers = DispatchGroup()
+        startReader(
+            standardOutput.fileHandleForReading,
+            capture: capture,
+            toStandardError: false,
+            group: readers
+        )
+        startReader(
+            standardError.fileHandleForReading,
+            capture: capture,
+            toStandardError: true,
+            group: readers
+        )
 
         do {
             try process.run()
         } catch {
-            standardOutput.fileHandleForReading.readabilityHandler = nil
-            standardError.fileHandleForReading.readabilityHandler = nil
+            closePipes(standardOutput, standardError)
             throw ProcessRunnerError.launchFailed(error.localizedDescription)
         }
 
+        // Process owns duplicated write descriptors after launch. Closing the
+        // parent's copies lets the readers observe EOF when the child exits.
+        try? standardOutput.fileHandleForWriting.close()
+        try? standardError.fileHandleForWriting.close()
+
         let boundedTimeout = max(timeout, 0.001)
-        var timedOut = completion.wait(timeout: .now() + boundedTimeout) == .timedOut
+        let timedOut = completion.wait(timeout: .now() + boundedTimeout) == .timedOut
         if timedOut {
             process.terminate()
             if completion.wait(timeout: .now() + 0.25) == .timedOut {
                 Darwin.kill(process.processIdentifier, SIGKILL)
-                _ = completion.wait(timeout: .now() + 1)
+                if completion.wait(timeout: .now() + 1) == .timedOut {
+                    closePipes(standardOutput, standardError)
+                    throw ProcessRunnerError.terminationFailed(
+                        processIdentifier: process.processIdentifier
+                    )
+                }
             }
         }
 
-        // Give readability handlers a final scheduling turn, then detach them;
-        // never wait for inherited pipe descriptors held by child processes.
-        Thread.sleep(forTimeInterval: 0.005)
-        standardOutput.fileHandleForReading.readabilityHandler = nil
-        standardError.fileHandleForReading.readabilityHandler = nil
-        let snapshot = capture.snapshot()
-
-        if process.isRunning {
-            Darwin.kill(process.processIdentifier, SIGKILL)
-            timedOut = true
+        // Normally both readers reach EOF immediately after process exit. If a
+        // descendant inherited a write descriptor, close our read ends rather
+        // than waiting indefinitely for that unrelated process.
+        if readers.wait(timeout: .now() + 0.25) == .timedOut {
+            try? standardOutput.fileHandleForReading.close()
+            try? standardError.fileHandleForReading.close()
+            guard readers.wait(timeout: .now() + 1) == .success else {
+                throw ProcessRunnerError.outputDrainFailed
+            }
         }
+        let snapshot = capture.snapshot()
 
         return ProcessResult(
             standardOutput: snapshot.standardOutput,
@@ -83,6 +101,35 @@ public enum ProcessRunner {
             timedOut: timedOut,
             outputTruncated: snapshot.truncated
         )
+    }
+
+    private static func startReader(
+        _ handle: FileHandle,
+        capture: OutputCapture,
+        toStandardError: Bool,
+        group: DispatchGroup
+    ) {
+        group.enter()
+        DispatchQueue.global(qos: .utility).async {
+            defer { group.leave() }
+            while true {
+                do {
+                    guard let data = try handle.read(upToCount: 64 * 1024), !data.isEmpty else {
+                        return
+                    }
+                    capture.append(data, toStandardError: toStandardError)
+                } catch {
+                    return
+                }
+            }
+        }
+    }
+
+    private static func closePipes(_ standardOutput: Pipe, _ standardError: Pipe) {
+        try? standardOutput.fileHandleForWriting.close()
+        try? standardError.fileHandleForWriting.close()
+        try? standardOutput.fileHandleForReading.close()
+        try? standardError.fileHandleForReading.close()
     }
 }
 

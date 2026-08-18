@@ -13,7 +13,10 @@ Started on 2026-08-17 on `agent/p0-reliability-hardening` after P0 publication.
   - termination status and timeout/truncation metadata;
   - typed launch failure;
   - graceful termination followed by bounded `SIGKILL` escalation;
-  - no indefinite wait on pipe descriptors inherited by grandchildren.
+  - dedicated concurrent stdout/stderr readers with exact trailing-output
+    capture;
+  - parent-side write-descriptor closure and a bounded drain fallback when
+    descendants inherit pipe descriptors.
 - Migrated every direct `Process` call in `agent_monitor.swift`, including `ps`,
   `lsof`, `pkill`, and WezTerm CLI operations.
 - Removed shell/awk interpolation from migrated process discovery and stop
@@ -26,8 +29,12 @@ Started on 2026-08-17 on `agent/p0-reliability-hardening` after P0 publication.
 - Captures stdout, stderr, and nonzero termination status.
 - Terminates a command at its deadline.
 - Caps captured output while continuing to drain the child pipe.
+- Captures large simultaneous stdout/stderr streams exactly.
+- Escalates when a process ignores `SIGTERM`.
+- Returns promptly when a descendant retains inherited pipe descriptors.
 
-The Swift suite now contains 10 passing tests. The complete app typechecks for
+The Swift suite now contains 13 passing tests. The ProcessRunner subset also
+passes 10 consecutive stress repetitions. The complete app typechecks for
 the macOS 14 target, and `agent_monitor.swift` contains no direct `Process`
 construction or unbounded pipe reads.
 
