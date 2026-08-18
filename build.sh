@@ -7,12 +7,20 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SWIFT_FILE="$SCRIPT_DIR/agent_monitor.swift"
 BINARY="$SCRIPT_DIR/agent_monitor"
+BUILD_OUTPUT="$SCRIPT_DIR/.agent_monitor.build.$$"
+trap 'rm -f "$BUILD_OUTPUT"' EXIT
 
 # Clean up pre-rename binary if present so stale processes can't sneak in
 rm -f "$SCRIPT_DIR/claude_monitor"
 
 # Check dependencies
-if ! command -v swiftc >/dev/null 2>&1; then
+if [ -n "${SWIFTC_BIN:-}" ]; then
+    SWIFT_COMMAND=("$SWIFTC_BIN")
+elif command -v xcrun >/dev/null 2>&1; then
+    SWIFT_COMMAND=(xcrun swiftc)
+elif command -v swiftc >/dev/null 2>&1; then
+    SWIFT_COMMAND=(swiftc)
+else
     echo "Error: Swift compiler not found."
     echo "Install Xcode Command Line Tools: xcode-select --install"
     exit 1
@@ -25,21 +33,39 @@ if ! command -v jq >/dev/null 2>&1; then
 fi
 
 echo "Compiling Agent Monitor..."
-swiftc "$SWIFT_FILE" \
-    -O \
-    -o "$BINARY" \
+SWIFT_OPTIMIZATION="${AGENT_MONITOR_OPTIMIZATION:--O}"
+DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-14.0}"
+BUILD_ARCH="$(uname -m)"
+case "$SWIFT_OPTIMIZATION" in
+    -O|-Osize|-Onone) ;;
+    *)
+        echo "Error: unsupported AGENT_MONITOR_OPTIMIZATION: $SWIFT_OPTIMIZATION"
+        exit 1
+        ;;
+esac
+case "$BUILD_ARCH" in
+    arm64|x86_64) ;;
+    *) echo "Error: unsupported build architecture: $BUILD_ARCH"; exit 1 ;;
+esac
+if ! [[ "$DEPLOYMENT_TARGET" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    echo "Error: invalid MACOSX_DEPLOYMENT_TARGET: $DEPLOYMENT_TARGET"
+    exit 1
+fi
+"${SWIFT_COMMAND[@]}" "$SWIFT_FILE" \
+    "$SCRIPT_DIR"/Sources/AgentMonitorCore/*.swift \
+    "$SWIFT_OPTIMIZATION" \
+    -o "$BUILD_OUTPUT" \
     -framework Cocoa \
     -framework SwiftUI \
     -framework Combine \
     -framework Security \
+    -target "$BUILD_ARCH-apple-macosx$DEPLOYMENT_TARGET" \
     -parse-as-library \
     -suppress-warnings \
     2>&1
 
-if [ $? -ne 0 ]; then
-    echo "Build failed!"
-    exit 1
-fi
+chmod 755 "$BUILD_OUTPUT"
+mv -f "$BUILD_OUTPUT" "$BINARY"
 
 echo "Build successful."
 
@@ -71,7 +97,7 @@ if [ -f "$VOICE_CACHE_SRC" ]; then
 fi
 
 # Always sync monitor scripts to hooks directory
-for hook in monitor.sh monitor_permission.py codex_notify.py install_codex_notify.py session_cleanup.py; do
+for hook in monitor.sh monitor_permission.py codex_notify.py install_codex_notify.py session_cleanup.py session_store.py; do
     if [ -f "$SCRIPT_DIR/$hook" ]; then
         cp "$SCRIPT_DIR/$hook" "$HOOKS_DIR/$hook"
         chmod +x "$HOOKS_DIR/$hook"

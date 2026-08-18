@@ -8,13 +8,16 @@ This file is a runbook for AI agents setting this up on behalf of a user. Follow
 
 ## Project structure
 
-- `agent_monitor.swift` — single-file SwiftUI app (the floating panel)
+- `agent_monitor.swift` — SwiftUI app entry point and floating panel
+- `Sources/AgentMonitorCore/` — tested persistence and framed-IPC primitives
+- `Package.swift` / `Tests/` — Swift and Python regression harnesses
 - `build.sh` — compile, sync hooks, create config, launch
 - `monitor.sh` — lifecycle hook script for Claude Code (SessionStart/Stop/etc, voice)
 - `monitor_permission.py` — permission-granting hook for Claude Code (Unix socket IPC)
 - `voice-cache.sh` — ElevenLabs TTS with local MP3 caching
 - `codex_notify.py` / `install_codex_notify.py` — Codex `notify` hook installer
 - `session_cleanup.py` — periodic cleanup of dead session files
+- `session_store.py` — locked, atomic cross-process session persistence
 - `config.default.json` — safe default config (tracked in git)
 - `config.json` — user's live config (gitignored, created from template on first build)
 - `phrases.json` — per-phrase voice tuning template
@@ -157,7 +160,7 @@ If sessions don't appear in Claude Code: double-check Step 5 merged into `~/.cla
 Kill + restart:
 
 ```bash
-pkill -9 agent_monitor; sleep 1; ~/.claude/monitor/build.sh
+pkill agent_monitor; sleep 1; ~/.claude/monitor/build.sh
 ```
 
 ### Skins
@@ -182,11 +185,43 @@ Claude Code waits for inherited file descriptors to close before considering a h
 
 ### Permission IPC architecture
 
-`monitor_permission.py` is launched by Claude Code's `PermissionRequest` hook, connects to the Unix socket at `~/.claude/monitor/monitor.sock`, writes a `.permission` file, and blocks until the Swift app responds. The Swift app displays Allow/Deny/Terminal buttons, sends the response back through the socket, and the hook unblocks. The hook's `timeout` in `settings.json` is set to `300` seconds (5 minutes) — matches `TIMEOUT_SECONDS` in `monitor_permission.py`.
+`monitor_permission.py` is launched by Claude Code's `PermissionRequest` hook.
+It atomically writes a private
+`{session_id}.{request_id}.permission` record, connects to the owner-only Unix
+socket at `~/.claude/monitor/monitor.sock`, and exchanges protocol-v1 JSON in
+bounded 4-byte length-prefixed frames. Accepted clients have a 10-second frame
+read timeout; registered requests have bounded deadlines. Multiple permission
+requests can be pending for one session. The UI removes a card only after its
+response frame is delivered, so a click that races socket registration remains
+available for retry. IPC failure exits cleanly and leaves Claude Code's terminal
+dialog as the fallback. The hook timeout is 300 seconds (5 minutes), matching
+`TIMEOUT_SECONDS`.
 
 ### Session file watching
 
-The Swift app watches `~/.claude/monitor/sessions/` using `DispatchSourceFileSystemObject` events (not interval polling). `monitor.sh` writes session JSON to that directory on every lifecycle event; the panel reacts immediately.
+The Swift app watches `~/.claude/monitor/sessions/` using
+`DispatchSourceFileSystemObject` events (not interval polling). All hook and app
+writers use the same per-record lock convention, unique same-directory temporary
+files, `fsync`, and atomic rename. Runtime directories are `0700` and records
+are `0600`; existing modes are repaired. Malformed records are quarantined as
+hidden `*.corrupt.*` files instead of being silently ignored forever.
+
+### Reliability checks
+
+Run these before publishing persistence, hook, or permission changes:
+
+```bash
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --disable-sandbox
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s Tests -p 'test_*.py' -v
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun swiftc -typecheck \
+  agent_monitor.swift Sources/AgentMonitorCore/*.swift \
+  -framework Cocoa -framework SwiftUI -framework Combine -framework Security \
+  -parse-as-library -target arm64-apple-macosx14.0
+```
+
+The Swift tests cover concurrent persistence, corruption recovery, private file
+modes, fragmented frames, oversized frames, and incomplete-frame timeouts. The
+Python suite covers concurrent hook events and permission-hook fallback/IPC.
 
 ### Defaults
 

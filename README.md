@@ -4,7 +4,7 @@
 
 **Command your AI agents from one floating panel.**
 
-Grant permissions without switching windows. Hear when an agent finishes or needs you. Track your usage quota. Click to jump to any session. Kill runaway tasks. All from a tiny always-on-top dashboard you can drag anywhere.
+Grant permissions without switching windows. Hear when an agent finishes or needs you. Track your usage quota. Click to jump to any session. Stop supported agent processes. All from a tiny always-on-top dashboard you can drag anywhere.
 
 <br>
 
@@ -183,6 +183,34 @@ Your settings live in `~/.claude/monitor/config.json` and the easiest way to cha
 
 Full config reference: [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
 
+## Reliability and privacy
+
+Agent Monitor keeps session state locally in `~/.claude/monitor/sessions/`.
+Session records can contain working directories and prompt previews; permission
+records can briefly contain tool names and bounded tool-input details. The
+directory is restricted to your account (`0700`) and records use mode `0600`.
+
+Lifecycle updates are merged under per-session cross-process locks and promoted
+with atomic writes. If a record is malformed, the app quarantines it as a
+hidden `*.corrupt.*` file instead of repeatedly failing to load the panel.
+Permission messages use a bounded, versioned, length-prefixed local protocol.
+If the app is unavailable or IPC fails, the hook exits cleanly and Claude Code
+falls back to its terminal permission dialog.
+
+There is not yet an in-app retention control. Remove old session history by
+stopping Agent Monitor and deleting only the files inside
+`~/.claude/monitor/sessions/`; they are recreated as new events arrive.
+
+Developer checks:
+
+```bash
+swift test
+python3 -m unittest discover -s Tests -p 'test_*.py' -v
+```
+
+The reliability review, findings, and roadmap live in
+[`project/reliability-2026-08/`](project/reliability-2026-08/README.md).
+
 ## Troubleshooting
 
 See the full [Troubleshooting Guide](docs/TROUBLESHOOTING.md). The quick fixes:
@@ -190,19 +218,19 @@ See the full [Troubleshooting Guide](docs/TROUBLESHOOTING.md). The quick fixes:
 | Problem | Fix |
 |---------|-----|
 | Sessions don't appear | Send a prompt in that session to trigger the hook |
-| Clicked Allow, nothing happened | `pkill -9 agent_monitor && ~/.claude/monitor/build.sh` |
+| Clicked Allow, nothing happened | Leave the card available for retry; if it persists, gracefully restart with `pkill agent_monitor && ~/.claude/monitor/build.sh` |
 | Click doesn't switch tabs | Your terminal may not support click-to-switch (see the compatibility table) |
 | No voice | Check `announce.enabled` is on and `volume` > 0 in settings |
 | ElevenLabs is silent | Verify your API key and `voice_id` are set — fall back to `say` always works |
 | Usage shows "No credentials" | Run `claude login` — or turn usage tracking off in settings |
-| Panel disappeared | `pkill -9 agent_monitor && ~/.claude/monitor/build.sh` |
+| Panel disappeared | `pkill agent_monitor && ~/.claude/monitor/build.sh` |
 
 ## Uninstall
 
 ```bash
 pkill agent_monitor
 rm -rf ~/.claude/monitor ~/.claude/voice-cache
-rm -f ~/.claude/hooks/monitor.sh ~/.claude/hooks/monitor_permission.py ~/.claude/hooks/voice-cache.sh
+rm -f ~/.claude/hooks/monitor.sh ~/.claude/hooks/monitor_permission.py ~/.claude/hooks/session_store.py ~/.claude/hooks/session_cleanup.py ~/.claude/hooks/codex_notify.py ~/.claude/hooks/install_codex_notify.py ~/.claude/hooks/voice-cache.sh
 ```
 
 Then remove the six hook entries (`SessionStart`, `UserPromptSubmit`, `Stop`, `Notification`, `PermissionRequest`, `SessionEnd`) from `~/.claude/settings.json`, and the `notify` line from `~/.codex/config.toml` if you use Codex.

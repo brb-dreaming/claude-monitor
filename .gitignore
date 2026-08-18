@@ -1,6 +1,9 @@
 # Compiled binary
 agent_monitor
 claude_monitor
+.build/
+__pycache__/
+*.pyc
 
 # Runtime session data
 sessions/
@@ -9,6 +12,7 @@ agent_monitor.lock
 claude_monitor.lock
 layer_debug.txt
 codex_notify_chain.json
+codex_notify_chain.json.loop-backup
 
 # Internal reviews
 reviews/

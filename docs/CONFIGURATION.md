@@ -4,7 +4,10 @@ Configuration lives in `~/.claude/monitor/config.json`. This file is **gitignore
 
 On first build, `build.sh` copies `config.default.json` → `config.json` if it doesn't exist. To reset to defaults, delete `config.json` and rebuild.
 
-Changes are picked up by the hook script on the next event and by the SwiftUI app when it re-reads config. Changes made through the settings popover are written to `config.json` immediately.
+Changes are picked up by the hook script on the next event. Changes made through
+the settings popover are applied by the app and written immediately. After a
+manual external edit, restart Agent Monitor to guarantee the app reloads it;
+external-file watching is not implemented yet.
 
 ## Full Default Config
 
