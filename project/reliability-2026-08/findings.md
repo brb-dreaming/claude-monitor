@@ -151,6 +151,13 @@ actor and publish only the final UI action on the main actor.
 
 ### AM-007 — Kill UI can hide a still-running process
 
+**P1 status (2026-08-18): Addressed.** The ambiguous kill control is now an
+action menu with separate Stop and Dismiss operations. Stop resolves exact
+agent PIDs on the session TTY, displays them for confirmation, revalidates PID,
+executable, and TTY before signaling, and removes the row only after verified
+exit. A failed graceful stop remains visible and offers explicit force-stop or
+dismiss-only choices.
+
 **Confidence:** Confirmed statically.
 
 **Evidence:** The session file is removed after three seconds regardless of

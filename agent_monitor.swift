@@ -2322,26 +2322,26 @@ func switchByTerminalCwd(cwd: String) {
     }
 }
 
-// MARK: - Session Killer
+// MARK: - Session Controls
 
-func killSession(_ session: SessionInfo) {
-    DispatchQueue.global(qos: .userInitiated).async {
-        killSessionInBackground(session)
-    }
+enum SessionTargetResolution {
+    case ready([SessionProcessTarget])
+    case notRunning
+    case failed(String)
 }
 
-private func killSessionInBackground(_ session: SessionInfo) {
+private func resolveTTYName(for target: TerminalTarget) -> String? {
     var ttyName: String?
 
-    if session.terminal == "terminal" && !session.terminal_session_id.isEmpty {
-        ttyName = session.terminal_session_id.replacingOccurrences(of: "/dev/", with: "")
-    } else if session.terminal == "wezterm" && !session.terminal_session_id.isEmpty {
+    if target.terminal == "terminal" && !target.sessionId.isEmpty {
+        ttyName = target.sessionId.replacingOccurrences(of: "/dev/", with: "")
+    } else if target.terminal == "wezterm" && !target.sessionId.isEmpty {
         // Get TTY from wezterm CLI for this pane
         if let result = runWezTermCLI(arguments: ["list", "--format", "json"]),
            result.succeeded,
            let panes = try? JSONSerialization.jsonObject(with: result.standardOutput) as? [[String: Any]] {
             for pane in panes {
-                if let paneId = pane["pane_id"] as? Int, String(paneId) == session.terminal_session_id {
+                if let paneId = pane["pane_id"] as? Int, String(paneId) == target.sessionId {
                     if let tty = pane["tty_name"] as? String {
                         ttyName = tty.replacingOccurrences(of: "/dev/", with: "")
                     }
@@ -2349,18 +2349,18 @@ private func killSessionInBackground(_ session: SessionInfo) {
                 }
             }
         }
-    } else if session.terminal == "iterm2" && !session.terminal_session_id.isEmpty {
+    } else if target.terminal == "iterm2" && !target.sessionId.isEmpty {
         let uniqueId: String
-        if let suffix = session.terminal_session_id.split(separator: ":", maxSplits: 1).last,
-           session.terminal_session_id.contains(":") {
+        if let suffix = target.sessionId.split(separator: ":", maxSplits: 1).last,
+           target.sessionId.contains(":") {
             uniqueId = String(suffix)
         } else {
-            uniqueId = session.terminal_session_id
+            uniqueId = target.sessionId
         }
 
         // Sanitize: iTerm2 unique IDs are UUIDs (hex + dashes)
         let sanitizedId = uniqueId.filter { $0.isHexDigit || $0 == "-" }
-        guard sanitizedId == uniqueId else { return }
+        guard sanitizedId == uniqueId else { return nil }
         let script = """
         tell application "iTerm2"
             repeat with w in windows
@@ -2383,27 +2383,136 @@ private func killSessionInBackground(_ session: SessionInfo) {
         }
     }
 
-    if let tty = ttyName {
-        // Sanitize: TTY names are alphanumeric (e.g., "ttys017")
-        let sanitized = tty.filter { $0.isLetter || $0.isNumber }
-        guard sanitized == tty else {
-            NSLog("[AgentMonitor] killSession: rejecting suspicious tty: %@", tty)
-            return
-        }
-        let processPattern = session.agent == "codex" ? "codex" : "claude"
-        _ = try? ProcessRunner.run(
-            executableURL: URL(fileURLWithPath: "/usr/bin/pkill"),
-            arguments: ["-TERM", "-t", sanitized, "-f", processPattern],
-            timeout: 3,
-            maximumOutputBytes: 4096
-        )
+    guard let tty = ttyName else { return nil }
+    let sanitized = tty.filter { $0.isLetter || $0.isNumber }
+    guard sanitized == tty else {
+        NSLog("[AgentMonitor] session controls: rejecting suspicious tty: %@", tty)
+        return nil
+    }
+    return sanitized
+}
+
+private func resolveTTYName(for session: SessionInfo) -> String? {
+    let storedTarget = TerminalTarget(
+        terminal: session.terminal,
+        sessionId: session.terminal_session_id
+    )
+    if let tty = resolveTTYName(for: storedTarget) {
+        return tty
     }
 
-    // Remove session file — user explicitly dismissed it
-    let home = FileManager.default.homeDirectoryForCurrentUser.path
-    let sessionFile = "\(home)/.claude/monitor/sessions/\(session.session_id).json"
-    DispatchQueue.global().asyncAfter(deadline: .now() + 3) {
-        _ = try? SessionFileStore.remove(at: URL(fileURLWithPath: sessionFile))
+    let liveTarget: TerminalTarget?
+    if session.agent == "codex", !session.thread_id.isEmpty {
+        liveTarget = resolveLiveCodexTarget(threadID: session.thread_id)
+            ?? resolveLiveTarget(agent: session.agent, cwd: session.cwd)
+    } else {
+        liveTarget = resolveLiveTarget(agent: session.agent, cwd: session.cwd)
+    }
+    return liveTarget.flatMap(resolveTTYName(for:))
+}
+
+func resolveSessionStopTargets(
+    _ session: SessionInfo,
+    completion: @escaping (SessionTargetResolution) -> Void
+) {
+    DispatchQueue.global(qos: .userInitiated).async {
+        let resolution: SessionTargetResolution
+        guard let ttyName = resolveTTYName(for: session) else {
+            resolution = .failed("Could not resolve this session to a live terminal.")
+            DispatchQueue.main.async { completion(resolution) }
+            return
+        }
+
+        do {
+            let targets = try SessionProcessController.resolveTargets(
+                ttyName: ttyName,
+                agent: session.agent
+            )
+            resolution = targets.isEmpty ? .notRunning : .ready(targets)
+        } catch {
+            resolution = .failed(error.localizedDescription)
+        }
+        DispatchQueue.main.async { completion(resolution) }
+    }
+}
+
+func stopSession(
+    _ session: SessionInfo,
+    targets: [SessionProcessTarget],
+    force: Bool,
+    completion: @escaping (SessionStopResult) -> Void
+) {
+    DispatchQueue.global(qos: .userInitiated).async {
+        guard let ttyName = targets.first?.ttyName else {
+            DispatchQueue.main.async { completion(.notRunning) }
+            return
+        }
+
+        let currentTargets: [SessionProcessTarget]
+        do {
+            currentTargets = try SessionProcessController.resolveTargets(
+                ttyName: ttyName,
+                agent: session.agent
+            )
+        } catch {
+            DispatchQueue.main.async { completion(.failed(error.localizedDescription)) }
+            return
+        }
+        let confirmedPIDs = Set(targets.map(\.pid))
+        let currentPIDs = Set(currentTargets.map(\.pid))
+        guard currentPIDs == confirmedPIDs else {
+            DispatchQueue.main.async {
+                completion(.failed("The target process changed before it could be stopped. Choose Stop Agent again to review the current PID."))
+            }
+            return
+        }
+
+        var result = SessionProcessController.stop(
+            targets: targets,
+            agent: session.agent,
+            force: force,
+            gracePeriod: force ? 1 : 2
+        )
+        if case .stopped = result {
+            do {
+                let remaining = try SessionProcessController.resolveTargets(
+                    ttyName: ttyName,
+                    agent: session.agent
+                )
+                if !remaining.isEmpty {
+                    result = .failed("A new matching process appeared while stopping the confirmed PID. The monitor entry was kept; choose Stop Agent again to review it.")
+                }
+            } catch {
+                result = .failed("The confirmed process exited, but final verification failed: \(error.localizedDescription)")
+            }
+        }
+        DispatchQueue.main.async { completion(result) }
+    }
+}
+
+func dismissSession(_ session: SessionInfo, completion: @escaping (String?) -> Void) {
+    DispatchQueue.global(qos: .utility).async {
+        let safeId = session.session_id.filter { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" }
+        guard !safeId.isEmpty, safeId == session.session_id else {
+            DispatchQueue.main.async { completion("The session identifier is invalid.") }
+            return
+        }
+
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let sessionsDirectory = URL(fileURLWithPath: "\(home)/.claude/monitor/sessions", isDirectory: true)
+        let sessionFile = sessionsDirectory.appendingPathComponent("\(safeId).json")
+        do {
+            _ = try SessionFileStore.remove(at: sessionFile)
+            let files = try FileManager.default.contentsOfDirectory(atPath: sessionsDirectory.path)
+            let permissionPrefix = "\(safeId)."
+            for file in files where file == "\(safeId).permission"
+                || (file.hasPrefix(permissionPrefix) && file.hasSuffix(".permission")) {
+                try? FileManager.default.removeItem(at: sessionsDirectory.appendingPathComponent(file))
+            }
+            DispatchQueue.main.async { completion(nil) }
+        } catch {
+            DispatchQueue.main.async { completion(error.localizedDescription) }
+        }
     }
 }
 
@@ -2448,20 +2557,28 @@ struct PulsingDot: View {
 
 struct SessionRowView: View {
     let session: SessionInfo
-    var onKill: (() -> Void)? = nil
+    let onOpen: () -> Void
     @Environment(\.skin) private var skin
     @State private var isHovered = false
-    @State private var isKilling = false
+    @State private var isResolving = false
+    @State private var isStopping = false
+    @State private var stopTargets: [SessionProcessTarget] = []
+    @State private var showStopConfirmation = false
+    @State private var showFailure = false
+    @State private var failureMessage = ""
+    @State private var canForceStop = false
+    @State private var canDismissAfterFailure = false
 
     var body: some View {
         let sc = session.statusColor(for: skin)
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
+        HStack(alignment: .center, spacing: 8) {
             PulsingDot(
                 color: sc,
                 isPulsing: session.status == "working",
                 size: skin.dotSize
             )
-            .alignmentGuide(.firstTextBaseline) { d in d[VerticalAlignment.center] + 2 }
+            .contentShape(Rectangle())
+            .onTapGesture(perform: onOpen)
 
             VStack(alignment: .leading, spacing: 1) {
                 HStack(spacing: 5) {
@@ -2484,26 +2601,6 @@ struct SessionRowView: View {
 
                     Spacer(minLength: 0)
 
-                    if onKill != nil {
-                        ZStack {
-                            if isKilling {
-                                PulsingDot(color: .red, isPulsing: true, size: skin.dotSize)
-                            } else if isHovered {
-                                Button {
-                                    isKilling = true
-                                    onKill?()
-                                } label: {
-                                    Image(systemName: "xmark")
-                                        .font(.system(size: 9, weight: .semibold))
-                                        .foregroundColor(skin.colors.killButton)
-                                        .contentShape(Rectangle())
-                                }
-                                .buttonStyle(.plain)
-                            }
-                        }
-                        .frame(width: 28, height: 28)
-                    }
-
                     Text(session.elapsedString)
                         .font(.system(size: 10, design: .monospaced))
                         .foregroundColor(skin.colors.timestamp)
@@ -2518,10 +2615,125 @@ struct SessionRowView: View {
                         .truncationMode(.tail)
                 }
             }
+            .contentShape(Rectangle())
+            .onTapGesture(perform: onOpen)
+
+            ZStack {
+                if isResolving || isStopping {
+                    ProgressView()
+                        .controlSize(.small)
+                } else {
+                    Menu {
+                        Button("Stop Agent…", role: .destructive) {
+                            prepareStop()
+                        }
+                        Button("Dismiss from Monitor") {
+                            dismiss()
+                        }
+                    } label: {
+                        Image(systemName: "ellipsis.circle")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundColor(skin.colors.killButton)
+                            .contentShape(Rectangle())
+                    }
+                    .menuStyle(.borderlessButton)
+                    .menuIndicator(.hidden)
+                    .help("Session actions")
+                    .opacity(isHovered ? 1 : 0.35)
+                }
+            }
+            .frame(width: 28, height: 28)
         }
         .padding(.leading, 15)
         .padding(.vertical, 6)
         .onHover { isHovered = $0 }
+        .alert("Stop \(session.displayAgent)?", isPresented: $showStopConfirmation) {
+            Button("Stop", role: .destructive) {
+                performStop(force: false)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Send a graceful stop signal to \(targetDescription)? The row will be removed only after exit is verified.")
+        }
+        .alert("Session Action Failed", isPresented: $showFailure) {
+            if canForceStop {
+                Button("Force Stop", role: .destructive) {
+                    performStop(force: true)
+                }
+            }
+            if canDismissAfterFailure {
+                Button("Dismiss Only") {
+                    dismiss()
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(failureMessage)
+        }
+    }
+
+    private var targetDescription: String {
+        let pids = stopTargets.map { String($0.pid) }.joined(separator: ", ")
+        return "PID\(stopTargets.count == 1 ? "" : "s") \(pids)"
+    }
+
+    private func prepareStop() {
+        isResolving = true
+        resolveSessionStopTargets(session) { resolution in
+            isResolving = false
+            switch resolution {
+            case .ready(let targets):
+                stopTargets = targets
+                showStopConfirmation = true
+            case .notRunning:
+                presentFailure(
+                    "No matching \(session.displayAgent) process is running. The monitor entry can be dismissed without stopping anything.",
+                    canDismiss: true
+                )
+            case .failed(let message):
+                presentFailure(message, canDismiss: true)
+            }
+        }
+    }
+
+    private func performStop(force: Bool) {
+        isStopping = true
+        stopSession(session, targets: stopTargets, force: force) { result in
+            isStopping = false
+            switch result {
+            case .stopped, .notRunning:
+                dismiss()
+            case .stillRunning(let pids):
+                stopTargets = stopTargets.filter { pids.contains($0.pid) }
+                let list = pids.map(String.init).joined(separator: ", ")
+                presentFailure(
+                    "PID\(pids.count == 1 ? "" : "s") \(list) did not exit after \(force ? "a force stop" : "the graceful stop").",
+                    canForce: !force,
+                    canDismiss: true
+                )
+            case .failed(let message):
+                presentFailure(message, canDismiss: true)
+            }
+        }
+    }
+
+    private func dismiss() {
+        dismissSession(session) { error in
+            if let error {
+                presentFailure("The monitor entry could not be dismissed: \(error)")
+            }
+        }
+    }
+
+    private func presentFailure(
+        _ message: String,
+        canForce: Bool = false,
+        canDismiss: Bool = false
+    ) {
+        failureMessage = message
+        canForceStop = canForce
+        canDismissAfterFailure = canDismiss
+        showFailure = true
     }
 }
 
@@ -3653,13 +3865,10 @@ struct MonitorContentView: View {
                 ScrollView {
                     VStack(spacing: 0) {
                         ForEach(reader.sessions) { session in
-                            Button {
-                                switchToSession(session)
-                            } label: {
-                                SessionRowView(session: session, onKill: { killSession(session) })
-                                    .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
+                            SessionRowView(
+                                session: session,
+                                onOpen: { switchToSession(session) }
+                            )
 
                             ForEach(reader.permissions[session.id] ?? []) { perm in
                                 PermissionActionView(

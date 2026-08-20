@@ -79,9 +79,10 @@ is recorded in `p1-implementation.md`.
 
 ### 8. Make destructive controls truthful
 
-- Separate Stop and Dismiss.
-- Resolve the exact target and show it.
-- Verify termination and report failure; expose force-kill only as escalation.
+- [x] Separate Stop and Dismiss.
+- [x] Resolve the exact target and show it.
+- [x] Verify termination and report failure; expose force-kill only as
+  escalation.
 
 ### 9. Add support-grade observability
 
